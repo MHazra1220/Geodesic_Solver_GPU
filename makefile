@@ -1,17 +1,11 @@
-main.sh: main.o world.o particle.o camera.o
-	nvcc -o main.sh main.o world.o particle.o camera.o -Xcompiler -fopenmp -O1
+main.sh: main.o photon.o
+	nvcc -o main.sh main.o photon.o
 
 main.o: main.cu
-	nvcc -c main.cu -O1
+	nvcc -c main.cu -dc
 
-world.o: world.h world.cpp
-	nvcc -c world.cpp -O1
+photon.o: photon.h photon.cu
+	nvcc -c photon.cu -dc
 
-particle.o: particle.h particle.cpp
-	nvcc -c particle.cpp -O1
-
-camera.o: camera.h camera.cpp
-	nvcc -c camera.cpp -Xcompiler -fopenmp -O1
-
-clean:
-	rm main.o world.o particle.o camera.o
+make clean:
+	rm main.o photon.o

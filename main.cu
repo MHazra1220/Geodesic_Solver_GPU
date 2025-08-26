@@ -36,14 +36,9 @@ int main()
     int threadsPerBlock { 256 };
     int numBlocks { (num_photons + threadsPerBlock - 1) / threadsPerBlock };
     normalisePhotonVelocities<<<numBlocks, threadsPerBlock>>>(device_photons, width, height);
-    err = cudaGetLastError();
 
     // Transfer back to host.
     err = cudaMemcpy(host_photons, device_photons, photon_array_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess)
-    {
-        std::cout << "FAILED" << "\n";
-    }
 
     std::cout << host_photons[0].v[0] << "\n";
     std::cout << host_photons[0].v[1] << "\n";

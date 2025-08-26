@@ -2,7 +2,7 @@
 #define PARTICLE
 
 // This should be allocated on host and moved to device as a large array of photons (one per pixel).
-// Calculations should be done on device.
+// Calculations should be done on the device.
 class Photon
 {
     public:

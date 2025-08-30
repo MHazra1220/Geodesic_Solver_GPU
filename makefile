@@ -1,11 +1,11 @@
-main.sh: main.o photon.o
-	nvcc -o main.sh main.o photon.o
+main.sh: main.o scene.o
+	nvcc -o main.sh main.o scene.o
 
 main.o: main.cu
-	nvcc -c main.cu -dc
+	nvcc -c main.cu
 
-photon.o: photon.h photon.cu
-	nvcc -c photon.cu -dc
+scene.o: scene.h scene.cu
+	nvcc -c scene.cu -diag-suppress 550
 
 make clean:
-	rm main.o photon.o
+	rm main.o scene.o

@@ -29,10 +29,11 @@ __device__ void Photon::makeVNull()
     float b { 0. };
     // c is the scalar product of the spatial metric with the spatial velocity components.
     float c { 0. };
+    float contraction;
     for (int i { 1 }; i < 4; i++)
     {
         b += metric[0][i] * v[i];
-        float contraction { 0. };
+        contraction = 0.;
         for (int j { 1 }; j < 4; j++)
         {
             contraction += metric[i][j] * v[j];
@@ -47,7 +48,7 @@ __device__ void Photon::makeVNull()
     normaliseV();
 }
 
-// Makes the L2 (Euclidean) norm of the 4-velocity 1 for the sake
+// Makes the L2-norm of the 4-velocity 1 for the sake
 // of maintaining a roughly consistent affine parameterisation.
 // WARNING: this is not a "unit" velocity!
 __device__ void Photon::normaliseV()
@@ -59,22 +60,45 @@ __device__ void Photon::normaliseV()
     }
 }
 
-__device__ void Photon::setMetric()
+// Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.
+// Gets the metric at x_temp and writes it into metric_temp.
+__device__ void Photon::getMetricTensor(float x_temp[4], float metric_temp[4][4])
 {
-    metric[0][0] = -1.;
-    for (int i { 1 }; i < 4; i++)
+    const float r_s { 1. };
+    float r_squared { norm3df(x_temp[1], x_temp[2], x_temp[3]) };
+    float r { sqrt(r_squared) };
+    float mult_factor { r_s / (r_squared*(r-r_s)) };
+    for (int mu { 1 }; mu < 4; mu++)
     {
-        for (int j { i }; j < 4; j++)
+        metric_temp[0][mu] = 0.;
+        metric_temp[mu][0] = 0.;
+        for (int nu { mu }; nu < 4; nu++)
         {
-            if (i == j)
-            {
-                metric[i][j] = 1.;
-            }
-            else
-            {
-                metric[i][j] = 0.;
-                metric[j][i] = 0.;
-            }
+            metric_temp[mu][nu] = mult_factor*x_temp[mu]*x_temp[nu];
+            metric_temp[nu][mu] = metric_temp[mu][nu];
         }
+    }
+    metric_temp[0][0] = -1. + r_s/r;
+    metric_temp[1][1] += 1.;
+    metric_temp[2][2] += 1.;
+    metric_temp[3][3] += 1.;
+}
+
+__global__ void normalisePhotonVelocities(Photon photons[], int width, int height)
+{
+    int photon_num = blockDim.x * blockIdx.x + threadIdx.x;
+    if (photon_num < width*height)
+    {
+        Photon &photon = photons[photon_num];
+        photon.x[0] = 0.;
+        photon.x[1] = -10.;
+        photon.x[2] = 0.;
+        photon.x[3] = 0.;
+        photon.v[1] = 1.;
+        photon.v[2] = 1.;
+        photon.v[3] = 1.;
+        // This will update photon.metric due to array decay to a pointer.
+        photon.getMetricTensor(photon.x, photon.metric);
+        photon.makeVNull();
     }
 }

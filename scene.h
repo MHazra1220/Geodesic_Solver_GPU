@@ -39,20 +39,6 @@ class Scene
         float fov_width;
         float fov_width_rad;
 
-        // Photon parameters.
-        // 4D spacetime coordinates of the photons (should be allocated to an [N][4] array).
-        float *host_x { nullptr };
-        float *device_x { nullptr };
-        // 4D spacetime velocities.
-        float *host_v { nullptr };
-        float *device_v { nullptr };
-        // Metric tensors of the photons (allocated to [N][4][4] array).
-        float *host_metric { nullptr };
-        float *device_metric { nullptr };
-        // Christoffel symbols of the photons (allocated to [N][4][4][4] array).
-        float *host_c_symbols { nullptr };
-        float *device_c_symbols { nullptr };
-
         // ------------- Function forward declarations.
         // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
         void importSkyMap(char image_path[]);
@@ -65,15 +51,17 @@ class Scene
         unsigned char* device_sky_map { nullptr };
         // List of pointers to the pixels that each photon should be. (dimension of [N] pointers).
         unsigned char* *device_pixels { nullptr };
-
-        // ------------- Function forward declarations.
-        // Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
-        __device__ void readPixelFromSkyMap(unsigned char *pixel, int &x, int &y);
-        __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
-        __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
-        __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
 };
 
-__device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
+// ------------- Function forward declarations.
+// Most of these are called only by the device when running the main raytracing CUDA kernel.
+namespace DeviceTraceFunctions
+{
+    __device__ void readPixelFromSkyMap(unsigned char *device_sky_map, unsigned char *pixel, int &x, int &y, int &sky_pixels_w, int &byte_depth);
+    __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
+    __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
+    __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
+    __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
+}
 
 #endif

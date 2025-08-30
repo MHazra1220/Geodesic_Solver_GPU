@@ -17,7 +17,7 @@ __device__ void hamiltonProduct(float u[4], float v[4], float result[4])
 
 // Rotates a 3D cartesian vector, vec (given as a quaternion with no real part), by the given quaternion, rotation_quat.
 // result will be the rotated vector represented as a quaternion with no real part.
-__device__ void quaternionRotate(float vec[4], float rotation_quat[4], float result[4])
+__device__ void rotateVecByQuat(float vec[4], float rotation_quat[4], float result[4])
 {
     // Assume that rotation_quat is normalised.
     float rotation_quat_inverse[4];

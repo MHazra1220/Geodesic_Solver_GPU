@@ -1,4 +1,5 @@
 #include "scene.h"
+#include "quaternion.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <stdexcept>
@@ -47,14 +48,14 @@ void Scene::freeSkyMapDevice()
 }
 
 // Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
-__device__ void Scene::readPixelFromSkyMap(unsigned char *pixel, int &x, int &y)
+__device__ void DeviceTraceFunctions::readPixelFromSkyMap(unsigned char *device_sky_map, unsigned char *pixel, int &x, int &y, int &sky_pixels_w, int &byte_depth)
 {
     pixel = &device_sky_map[(y*sky_pixels_w + x)*byte_depth];
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.
 // Gets the metric at x_func and overwrites it into metric_func.
-__device__ void Scene::getMetricTensor(float x_func[4], float metric_func[4][4])
+__device__ void DeviceTraceFunctions::getMetricTensor(float x_func[4], float metric_func[4][4])
 {
     const float r_s { 1. };
     float r { norm3df(x_func[1], x_func[2], x_func[3]) };
@@ -76,7 +77,7 @@ __device__ void Scene::getMetricTensor(float x_func[4], float metric_func[4][4])
     metric_func[3][3] += 1.;
 }
 
-__device__ void Scene::getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4])
+__device__ void DeviceTraceFunctions::getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4])
 {
     // Assumed default step in each coordinate.
     // TODO: How do you define this adaptively to not break near areas of extreme distortion?
@@ -155,7 +156,7 @@ __device__ void Scene::getChristoffelSymbols(float x_func[4], float metric_func[
  * probably negative. Note that the more negative solution is needed
  * because the raytracer evolves photons "backwards".
  */
-__device__ void Scene::makeVNull(float v_func[4], float metric_func[4][4])
+__device__ void DeviceTraceFunctions::makeVNull(float v_func[4], float metric_func[4][4])
 {
     float a { metric_func[0][0] };
     float b { 0. };
@@ -180,7 +181,7 @@ __device__ void Scene::makeVNull(float v_func[4], float metric_func[4][4])
 
 // TODO: This doesn't get the correct result for asymmetric matrices! Not technically important here, but it's
 // indicative that something is wrong underneath.
-__device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4])
+__device__ void DeviceTraceFunctions::invertMetric(float metric_func[4][4], float metric_inverse[4][4])
 {
     // Assume that that there are no zeros on the diagonal of metric_func and that metric_inverse is currently the identity matrix.
     // Invert with forward and backward-propagation (i.e. LU-decomposition). metric_func and metric_temp are both overwritten to avoid memory allocation.

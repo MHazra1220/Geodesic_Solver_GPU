@@ -1,5 +1,5 @@
 #include "scene.h"
-#include <algorithm>
+#include "quaternion.h"
 #include <iostream>
 
 int main()
@@ -34,58 +34,6 @@ int main()
     //
     // // Free device memory.
     // err = cudaFree(device_photons);
-
-    float metric_func[4][4];
-    float metric_inverse[4][4];
-
-    // Define some test 4x4 symmetric matrix.
-    metric_func[0][0] = 2.;
-    metric_func[1][1] = 1.2;
-    metric_func[2][2] = -2.;
-    metric_func[3][3] = 0.5;
-    metric_func[0][1] = -0.4;
-    metric_func[1][0] = -2.;
-    metric_func[0][2] = 0.;
-    metric_func[2][0] = 0.;
-    metric_func[0][3] = -2.5;
-    metric_func[3][0] = -2.5;
-    metric_func[1][2] = -1.;
-    metric_func[2][1] = -1.;
-    metric_func[1][3] = 0.;
-    metric_func[3][1] = 0.;
-    metric_func[2][3] = 1.;
-    metric_func[3][2] = 1.;
-
-    for (int i { 0 }; i < 4; i++)
-    {
-        for (int j { 0 }; j < 4; j++)
-        {
-            std::cout << metric_func[i][j] << "\t";
-            // Set metric_inverse to the identity.
-            if (i == j)
-            {
-                metric_inverse[i][j] = 1.;
-            }
-            else
-            {
-                metric_inverse[i][j] = 0.;
-            }
-
-        }
-        std::cout << "\n";
-    }
-
-    invertMetric(metric_func, metric_inverse);
-
-    for (int i { 0 }; i < 4; i++)
-    {
-        for (int j { 0 }; j < 4; j++)
-        {
-            std::cout << metric_inverse[i][j] << "\t";
-
-        }
-        std::cout << "\n";
-    }
 
     return 0;
 }

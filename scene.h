@@ -8,8 +8,8 @@ __device__ __constant__ float pi_device = 3.141592653589793;
 /*
  *  Metrics are currently defined in coordinates of (ct, x, y, z)
  *  with the assumption that c = 1 is set, so the coordinates are
- *  in just (t, x, y, z). In principle, however, the framework
- *  can handle general symmetric metrics in arbitrary coordinates.
+ *  in just (t, x, y, z). However, the framework
+ *  can handle general metrics in arbitrary coordinates.
  */
 
 // Scene contains information and routines about the scene, its objects and the sky map.
@@ -74,6 +74,6 @@ class Scene
         __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
 };
 
-__host__ __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
+__device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
 
 #endif

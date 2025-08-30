@@ -86,7 +86,6 @@ __device__ void Scene::getChristoffelSymbols(float x_func[4], float metric_func[
     // Simple Euler forward-difference derivatives of the metric along each component.
     float metric_derivs[4][4][4];
     float metric_temp[4][4];
-    float deriv_result;
     for (int alpha { 0 }; alpha < 4; alpha++)
     {
         // WARNING: Euler can be significantly faster than central difference; just use a very small step and it'll probably be okay.
@@ -98,9 +97,8 @@ __device__ void Scene::getChristoffelSymbols(float x_func[4], float metric_func[
         {
             for (int nu { mu }; nu < 4; nu++)
             {
-                deriv_result = metric_func[mu][nu] - metric_temp[mu][nu];
-                metric_derivs[alpha][mu][nu] = deriv_result;
-                metric_derivs[alpha][nu][mu] = deriv_result;
+                metric_derivs[alpha][mu][nu] = metric_func[mu][nu] - metric_temp[mu][nu];
+                metric_derivs[alpha][nu][mu] = metric_derivs[alpha][mu][nu];
             }
         }
         x_func[alpha] -= step;
@@ -108,7 +106,6 @@ __device__ void Scene::getChristoffelSymbols(float x_func[4], float metric_func[
 
     // Calculate the inverse of metric_func and overwrite it into metric_temp.
     // Set metric_temp to the identity matrix first.
-    // TODO: Replace this with std::fill() and just set 1s on the diagonals (if it will let you on a GPU...).
     for (int mu { 0 }; mu < 4; mu++)
     {
         for (int nu { mu }; nu < 4; nu++)
@@ -124,9 +121,31 @@ __device__ void Scene::getChristoffelSymbols(float x_func[4], float metric_func[
             }
         }
     }
-    // Store the inverse metric into metric_temp. metric_func is useless from here
-    // until it is assigned again in getMetricTensor() (it gets overwritten to an identity matrix).
+    // Store the inverse metric into metric_temp. metric_func is now useless
+    // until it is assigned again in getMetricTensor() (it gets overwritten by invertMetric()).
     invertMetric(metric_func, metric_temp);
+
+    // Calculate the 40 independent Christoffel symbols.
+    for (int alpha { 0 }; alpha < 4; alpha++)
+    {
+        for (int mu { 0 }; mu < 4; mu++)
+        {
+            for (int nu { mu }; nu < 4; nu++)
+            {
+                float component[4];
+                for (int gamma { 0 }; gamma < 4; gamma++)
+                {
+                    component[gamma] = metric_derivs[nu][mu][gamma] + metric_derivs[mu][nu][gamma] - metric_derivs[gamma][mu][nu];
+                }
+                // Remember that metric_temp is the inverse metric here.
+                c_symbols_func[alpha][mu][nu] = 0.5*(
+                    metric_temp[alpha][0]*component[0] + metric_temp[alpha][1]*component[1]
+                    + metric_temp[alpha][2]*component[2] + metric_temp[alpha][3]*component[3]
+                );
+                c_symbols_func[alpha][nu][mu] = c_symbols_func[alpha][mu][nu];
+            }
+        }
+    }
 }
 
 /*
@@ -159,11 +178,13 @@ __device__ void Scene::makeVNull(float v_func[4], float metric_func[4][4])
     v_func[0] = (-b + sqrt(b*b - 4.*a*c)) / (2.*a);
 }
 
-__host__ __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4])
+// TODO: This doesn't get the correct result for asymmetric matrices! Not technically important here, but it's
+// indicative that something is wrong underneath.
+__device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4])
 {
     // Assume that that there are no zeros on the diagonal of metric_func and that metric_inverse is currently the identity matrix.
     // Invert with forward and backward-propagation (i.e. LU-decomposition). metric_func and metric_temp are both overwritten to avoid memory allocation.
-    // WARNING: For now, assume that there are no zeros on the diagonal of the metric (very unlikely in Cartesian coordinates).
+    // WARNING: For now, assume that there are no zeros on the diagonal of the metric (very unlikely in t, x, y, z coordinates).
     float multiplier;
     // Forward-propagation pass.
     for (int i { 0 }; i < 3; i++)
@@ -185,12 +206,12 @@ __host__ __device__ void invertMetric(float metric_func[4][4], float metric_inve
     }
 
     // Backward-propagation pass.
-    for (int i { 3 }; i > -1; i--)
+    for (int i { 3 }; i > 0; i--)
     {
         for (int j { i-1 }; j > -1; j--)
         {
             multiplier = metric_func[j][i] / metric_func[i][i];
-            // Use the zeros in the lower-triangular half to reduce the number of calculations.
+            // Use the zeros in the lower-triangular half of metric_func to reduce the number of calculations.
             for (int k { i }; k < 4; k++)
             {
                 metric_func[j][k] -= multiplier*metric_func[i][k];

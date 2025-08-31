@@ -15,7 +15,7 @@ namespace DeviceTraceTools
     float *device_fov_conversion_factor { nullptr };
     float *device_pixels_w { nullptr };
     float *device_pixels_h { nullptr };
-    __device__ void calculateStartDirection(int &pixel_x, int &pixel_y, float photon_v[4]);
+    __device__ void calculateStartVelocity(int pixel_x, int pixel_y, float photon_v[4]);
     __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
     __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
     __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
@@ -27,7 +27,7 @@ namespace DeviceTraceTools
 };
 
 // Initialise Scene object with no sky map and default camera parameters.
-void Scene::initialiseDefault()
+void Scene::initialiseDefault(char sky_map[])
 {
     cudaError_t err { cudaSuccess };
     // The camera location and quaternion on the device only need to be allocated once here, then they can be copied to
@@ -42,16 +42,7 @@ void Scene::initialiseDefault()
     {
         throw std::runtime_error("Error: failed to allocate memory for camera quaternion on device.");
     }
-    // Set camera quaternion to default position and orientation and copy to device.
-    setCameraQuaternion((float*)&default_quat[0]);
-
-    // Initialise device memory for the FoV conversion factor and set a default FoV of 75 degrees.
-    err = cudaMalloc((void **)&DeviceTraceTools::device_fov_conversion_factor, sizeof(float));
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to allocate memory for FoV conversion factor on device.");
-    }
-
+    // Initialise device memory for the number of pixels and for the FoV conversion factor.
     err = cudaMalloc((void **)&DeviceTraceTools::device_pixels_w, sizeof(float));
     if (err != cudaSuccess)
     {
@@ -62,22 +53,19 @@ void Scene::initialiseDefault()
     {
         throw std::runtime_error("Error: failed to allocate memory for sky pixel height on device.");
     }
-
-    setCameraFoV(75.);
-}
-
-// Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
-void Scene::setCameraFoV(float new_fov_width)
-{
-    fov_width = new_fov_width;
-    fov_width_rad = fov_width * (180./pi_host);
-    float conversion_factor = fov_width_rad / sky_pixels_w;
-    cudaError_t err;
-    err = cudaMemcpy(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float), cudaMemcpyHostToDevice);
+    err = cudaMalloc((void **)&DeviceTraceTools::device_fov_conversion_factor, sizeof(float));
     if (err != cudaSuccess)
     {
-        throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
+        throw std::runtime_error("Error: failed to allocate memory for FoV conversion factor on device.");
     }
+
+    // Note sky_map will already have decayed to a char* pointer here.
+    importSkyMap(sky_map);
+    // Set camera quaternion to default position and orientation and copy to device.
+    setCameraCoordinates((float*)&default_camera_coords);
+    setCameraQuaternion((float*)&default_camera_quat);
+    // Default horizontal FoV is 75 degrees.
+    setCameraFoV(75.);
 }
 
 // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
@@ -96,6 +84,7 @@ void Scene::importSkyMap(char image_path[])
         theta_interval = pi_host / sky_pixels_h;
 
         // Reset existing device map (if it exists), then copy the new map and related information.
+        // This cannot be allocated in initialiseDefault() because its size is not known at compile-time.
         freeSkyMapDevice();
         cudaError_t err { cudaSuccess };
         size_t map_size { sizeof(unsigned char)*num_photons*byte_depth };
@@ -136,25 +125,53 @@ void Scene::freeSkyMapDevice()
     cudaFree(DeviceTraceTools::device_sky_map);
 }
 
-// When called, this will both set the host variable/pointer and copy it to DeviceTraceTools::camera_quaternion
+// Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
+void Scene::setCameraFoV(float new_fov_width)
+{
+    fov_width = new_fov_width;
+    fov_width_rad = fov_width * (pi_host/180.);
+    float conversion_factor = fov_width_rad / sky_pixels_w_float;
+    cudaError_t err;
+    err = cudaMemcpy(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
+    }
+}
+
+// When called, this will both set the host variable/pointer and copy it to DeviceTraceTools::camera_coords
 // to let the GPU access its own copy in device memory.
+void Scene::setCameraCoordinates(float x[4])
+{
+    for (int i { 0 }; i < 4; i++)
+    {
+        camera_coords[i] = x[i];
+    }
+    cudaError_t err { cudaMemcpy(DeviceTraceTools::device_camera_coords, &camera_coords, sizeof(float)*4, cudaMemcpyHostToDevice) };
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy camera coordinates to device.");
+    }
+}
+
 void Scene::setCameraQuaternion(float quaternion[4])
 {
     for (int i { 0 }; i < 4; i++)
     {
         camera_quat[i] = quaternion[i];
     }
-    cudaError_t err { cudaMemcpy(DeviceTraceTools::device_camera_quat, host_camera_quat, sizeof(float)*4, cudaMemcpyHostToDevice) };
+    cudaError_t err { cudaMemcpy(DeviceTraceTools::device_camera_quat, &camera_quat, sizeof(float)*4, cudaMemcpyHostToDevice) };
     if (err != cudaSuccess)
     {
-        throw std::runtime_error("Error: failed to copy camera quaternion from host to device.");
+        throw std::runtime_error("Error: failed to copy camera quaternion to device.");
     }
 }
 
-// Calculates the start direction of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
-__device__ void DeviceTraceTools::calculateStartDirection(int &pixel_x, int &pixel_y, float photon_v[4])
+// Calculates the start velocity of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
+__device__ void DeviceTraceTools::calculateStartVelocity(int pixel_x, int pixel_y, float photon_v[4])
 {
-
+    // float phi { -((pixel_x-0.5 * *DeviceTraceTools::device_pixels_w) * *DeviceTraceTools::device_fov_conversion_factor) };
+    // float theta { (pixel_y-0.5 * *DeviceTraceTools::device_pixels_h) * *DeviceTraceTools::device_fov_conversion_factor + 0.5*pi_device };
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.

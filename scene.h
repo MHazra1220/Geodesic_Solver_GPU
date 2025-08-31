@@ -41,26 +41,28 @@ class Scene
         // Camera FoV width in degrees and radians.
         float fov_width { 75. };
         float fov_width_rad;
+        float camera_coords[4];
         // Quaternion representing the camera orientation. (1., 0., 0., 0.) represents a camera pointing along +x with zero rotation.
         float camera_quat[4];
-        float *host_camera_quat { &camera_quat[0] };
 
         // ------------- Function forward declarations.
         // Initialise scene parameters with no sky map and default camera parameters.
-        void initialiseDefault();
-        void setCameraFoV(float new_fov_width);
+        void initialiseDefault(char sky_map[]);
         // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
         void importSkyMap(char image_path[]);
         void freeSkyMapHost();
         void freeSkyMapDevice();
 
     private:
+        const float default_camera_coords[4] { 0., -10., 0., 0. };
         // This default orientation corresponds to pointing along +x with no rotation.
-        const float default_quat[4] { 1., 0., 0., 0, };
+        const float default_camera_quat[4] { 1., 0., 0., 0, };
         // Pointer to the pixel array of the sky map.
         unsigned char* host_sky_map { nullptr };
 
         // ------------- Function forward declarations.
+        void setCameraFoV(float new_fov_width);
+        void setCameraCoordinates(float x[4]);
         void setCameraQuaternion(float quaternion[4]);
 };
 

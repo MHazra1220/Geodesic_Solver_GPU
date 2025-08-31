@@ -4,6 +4,82 @@
 #include "stb_image.h"
 #include <stdexcept>
 
+// These objects and functions are used by the GPU when tracing photons. They are defined outside Scene
+// in a separate namespace so that the GPU doesn't need a copy of the entire Scene object in device memory when calculating paths.
+namespace DeviceTraceTools
+{
+    // Device variables and functions.
+    unsigned char* device_sky_map { nullptr };
+    float *device_camera_coords { nullptr };
+    float *device_camera_quat{ nullptr };
+    float *device_fov_conversion_factor { nullptr };
+    float *device_pixels_w { nullptr };
+    float *device_pixels_h { nullptr };
+    __device__ void calculateStartDirection(int &pixel_x, int &pixel_y, float photon_v[4]);
+    __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
+    __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
+    __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
+    __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
+    __device__ void readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth);
+
+    // CUDA kernels.
+    __global__ void traceImage();
+};
+
+// Initialise Scene object with no sky map and default camera parameters.
+void Scene::initialiseDefault()
+{
+    cudaError_t err { cudaSuccess };
+    // The camera location and quaternion on the device only need to be allocated once here, then they can be copied to
+    // whenever the camera moves.
+    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_coords, sizeof(float)*4);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for camera coordinates on device.");
+    }
+    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_quat, sizeof(float)*4);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for camera quaternion on device.");
+    }
+    // Set camera quaternion to default position and orientation and copy to device.
+    setCameraQuaternion((float*)&default_quat[0]);
+
+    // Initialise device memory for the FoV conversion factor and set a default FoV of 75 degrees.
+    err = cudaMalloc((void **)&DeviceTraceTools::device_fov_conversion_factor, sizeof(float));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for FoV conversion factor on device.");
+    }
+
+    err = cudaMalloc((void **)&DeviceTraceTools::device_pixels_w, sizeof(float));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for sky pixel width on device.");
+    }
+    err = cudaMalloc((void **)&DeviceTraceTools::device_pixels_h, sizeof(float));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for sky pixel height on device.");
+    }
+
+    setCameraFoV(75.);
+}
+
+// Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
+void Scene::setCameraFoV(float new_fov_width)
+{
+    fov_width = new_fov_width;
+    fov_width_rad = fov_width * (180./pi_host);
+    float conversion_factor = fov_width_rad / sky_pixels_w;
+    cudaError_t err;
+    err = cudaMemcpy(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
+    }
+}
+
 // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
 void Scene::importSkyMap(char image_path[])
 {
@@ -14,21 +90,34 @@ void Scene::importSkyMap(char image_path[])
     if (host_sky_map != NULL)
     {
         num_photons = sky_pixels_w*sky_pixels_h;
+        sky_pixels_w_float = static_cast<float>(sky_pixels_w);
+        sky_pixels_h_float = static_cast<float>(sky_pixels_h);
         phi_interval = (2.*pi_host) / sky_pixels_w;
         theta_interval = pi_host / sky_pixels_h;
 
-        // Copy pixel map to device memory.
+        // Reset existing device map (if it exists), then copy the new map and related information.
+        freeSkyMapDevice();
         cudaError_t err { cudaSuccess };
         size_t map_size { sizeof(unsigned char)*num_photons*byte_depth };
-        err = cudaMalloc((void **)&device_sky_map, map_size);
+        err = cudaMalloc((void **)&DeviceTraceTools::device_sky_map, map_size);
         if (err != cudaSuccess)
         {
             throw std::runtime_error("Error: failed to allocate sky map memory on device.");
         }
-        err = cudaMemcpy(device_sky_map, host_sky_map, map_size, cudaMemcpyHostToDevice);
+        err = cudaMemcpy(DeviceTraceTools::device_sky_map, host_sky_map, map_size, cudaMemcpyHostToDevice);
         if (err != cudaSuccess)
         {
             throw std::runtime_error("Error: failed to copy sky map to device.");
+        }
+        err = cudaMemcpy(DeviceTraceTools::device_pixels_w, &sky_pixels_w_float, sizeof(float), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error("Error: failed to copy sky pixel width to device.");
+        }
+        err = cudaMemcpy(DeviceTraceTools::device_pixels_h, &sky_pixels_h_float, sizeof(float), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error("Error: failed to copy sky pixel height to device.");
         }
     }
     else
@@ -44,18 +133,33 @@ void Scene::freeSkyMapHost()
 
 void Scene::freeSkyMapDevice()
 {
-    cudaFree(device_sky_map);
+    cudaFree(DeviceTraceTools::device_sky_map);
 }
 
-// Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
-__device__ void DeviceTraceFunctions::readPixelFromSkyMap(unsigned char *device_sky_map, unsigned char *pixel, int &x, int &y, int &sky_pixels_w, int &byte_depth)
+// When called, this will both set the host variable/pointer and copy it to DeviceTraceTools::camera_quaternion
+// to let the GPU access its own copy in device memory.
+void Scene::setCameraQuaternion(float quaternion[4])
 {
-    pixel = &device_sky_map[(y*sky_pixels_w + x)*byte_depth];
+    for (int i { 0 }; i < 4; i++)
+    {
+        camera_quat[i] = quaternion[i];
+    }
+    cudaError_t err { cudaMemcpy(DeviceTraceTools::device_camera_quat, host_camera_quat, sizeof(float)*4, cudaMemcpyHostToDevice) };
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy camera quaternion from host to device.");
+    }
+}
+
+// Calculates the start direction of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
+__device__ void DeviceTraceTools::calculateStartDirection(int &pixel_x, int &pixel_y, float photon_v[4])
+{
+
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.
 // Gets the metric at x_func and overwrites it into metric_func.
-__device__ void DeviceTraceFunctions::getMetricTensor(float x_func[4], float metric_func[4][4])
+__device__ void DeviceTraceTools::getMetricTensor(float x_func[4], float metric_func[4][4])
 {
     const float r_s { 1. };
     float r { norm3df(x_func[1], x_func[2], x_func[3]) };
@@ -77,7 +181,7 @@ __device__ void DeviceTraceFunctions::getMetricTensor(float x_func[4], float met
     metric_func[3][3] += 1.;
 }
 
-__device__ void DeviceTraceFunctions::getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4])
+__device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4])
 {
     // Assumed default step in each coordinate.
     // TODO: How do you define this adaptively to not break near areas of extreme distortion?
@@ -156,7 +260,7 @@ __device__ void DeviceTraceFunctions::getChristoffelSymbols(float x_func[4], flo
  * probably negative. Note that the more negative solution is needed
  * because the raytracer evolves photons "backwards".
  */
-__device__ void DeviceTraceFunctions::makeVNull(float v_func[4], float metric_func[4][4])
+__device__ void DeviceTraceTools::makeVNull(float v_func[4], float metric_func[4][4])
 {
     float a { metric_func[0][0] };
     float b { 0. };
@@ -181,12 +285,14 @@ __device__ void DeviceTraceFunctions::makeVNull(float v_func[4], float metric_fu
 
 // TODO: This doesn't get the correct result for asymmetric matrices! Not technically important here, but it's
 // indicative that something is wrong underneath.
-__device__ void DeviceTraceFunctions::invertMetric(float metric_func[4][4], float metric_inverse[4][4])
+__device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float metric_inverse[4][4])
 {
     // Assume that that there are no zeros on the diagonal of metric_func and that metric_inverse is currently the identity matrix.
     // Invert with forward and backward-propagation (i.e. LU-decomposition). metric_func and metric_temp are both overwritten to avoid memory allocation.
     // WARNING: For now, assume that there are no zeros on the diagonal of the metric (very unlikely in t, x, y, z coordinates).
+
     float multiplier;
+
     // Forward-propagation pass.
     for (int i { 0 }; i < 3; i++)
     {
@@ -224,7 +330,7 @@ __device__ void DeviceTraceFunctions::invertMetric(float metric_func[4][4], floa
         }
     }
 
-    // Last task is to normalise the rows of metric_inverse by whatever is left in the diagonals of metric_func.
+    // Last task is to normalise the rows of metric_inverse by whatever is left in the diagonal of metric_func.
     for (int i { 0 }; i < 4; i++)
     {
         multiplier = 1./metric_func[i][i];
@@ -234,4 +340,10 @@ __device__ void DeviceTraceFunctions::invertMetric(float metric_func[4][4], floa
             metric_inverse[i][k] *= multiplier;
         }
     }
+}
+
+// Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
+__device__ void DeviceTraceTools::readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth)
+{
+    pixel = &device_sky_map[(y*sky_pixels_w + x)*byte_depth];
 }

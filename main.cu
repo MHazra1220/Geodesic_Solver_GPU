@@ -35,6 +35,7 @@ int main()
     // err = cudaFree(device_photons);
 
     Scene scene_test;
+    scene_test.initialiseDefault();
     char sky_map[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/sky_box_samples/full_milky_way.jpg" };
     scene_test.importSkyMap((char*)sky_map);
     scene_test.freeSkyMapHost();

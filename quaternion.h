@@ -1,5 +1,5 @@
-#ifndef QUATERNION
-#define QUATERNION
+#ifndef QUATERNION_H
+#define QUATERNION_H
 
 // Some quaternion arithmetic functions. Used when setting the starting velocities of photons.
 

@@ -1,4 +1,5 @@
 #include "scene.h"
+#include <cmath>
 #include <iostream>
 
 int main()
@@ -37,6 +38,7 @@ int main()
     char sky_map[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/sky_box_samples/full_milky_way.jpg" };
     Scene scene_test;
     scene_test.initialiseDefault(sky_map);
+    scene_test.runTraceKernel();
     scene_test.freeSkyMapHost();
     scene_test.freeSkyMapDevice();
 

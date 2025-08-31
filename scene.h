@@ -24,10 +24,10 @@ class Scene
         int sky_pixels_w;
         int sky_pixels_h;
         // Float versions are useful for calculation when sampling pixels from the sky map.
-        float sky_pixels_w_float;
-        float sky_pixels_h_float;
-        int num_photons;
-        // Interval of phi and theta in radians between each pixel.
+        float sky_pixels_w_f;
+        float sky_pixels_h_f;
+        int num_pixels;
+        // Interval of phi and theta in radians between each pixel of the sky map.
         float phi_interval;
         float theta_interval;
         // Number of bytes used to store each pixel, not bits! Should be 3 for RGB.
@@ -44,12 +44,16 @@ class Scene
         float camera_coords[4];
         // Quaternion representing the camera orientation. (1., 0., 0., 0.) represents a camera pointing along +x with zero rotation.
         float camera_quat[4];
+        // Camera pixel resolution.
+        int pixels_w;
+        int pixels_h;
 
         // ------------- Function forward declarations.
         // Initialise scene parameters with no sky map and default camera parameters.
         void initialiseDefault(char sky_map[]);
         // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
         void importSkyMap(char image_path[]);
+        void runTraceKernel();
         void freeSkyMapHost();
         void freeSkyMapDevice();
 
@@ -57,13 +61,27 @@ class Scene
         const float default_camera_coords[4] { 0., -10., 0., 0. };
         // This default orientation corresponds to pointing along +x with no rotation.
         const float default_camera_quat[4] { 1., 0., 0., 0, };
+        // Default horizontal FoV in degrees.
+        const float default_fov { 75. };
+        // Default resolution.
+        const int default_width { 1920 };
+        const int default_height { 1080 };
         // Pointer to the pixel array of the sky map.
         unsigned char* host_sky_map { nullptr };
 
         // ------------- Function forward declarations.
+        void setSkyMapDistance(float sky_distance);
         void setCameraFoV(float new_fov_width);
+        void setCameraRes(int width, int height);
         void setCameraCoordinates(float x[4]);
         void setCameraQuaternion(float quaternion[4]);
 };
+
+// Some quaternion arithmetic functions. Used when setting the starting velocities of photons.
+__device__ void hamiltonProduct(float u[4], float v[4], float result[4]);
+__device__ void rotateVecByQuat(float vec[4], float rotation_quat[4], float result[4]);
+
+// CUDA kernels.
+__global__ void traceImage(unsigned char *device_sky_map);
 
 #endif

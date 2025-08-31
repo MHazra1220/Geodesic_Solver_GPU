@@ -1,5 +1,4 @@
 #include "scene.h"
-#include "quaternion.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <stdexcept>
@@ -11,24 +10,67 @@ namespace DeviceTraceTools
     // Device variables and functions.
     // This pointer is left in host memory and assigned with cudaMemcpy because otherwise it cannot be deallocated by the host
     // with cudaFree().
-    unsigned char* device_sky_map { nullptr };
+    unsigned char *device_sky_map { nullptr };
     // Default camera coordinates are along -x and the camera faces along +x.
     __device__ float device_camera_coords[4] { 0., -10., 0., 0. };
     __device__ float device_camera_quat[4] { 1., 0., 0., 0. };
+    __device__ int device_pixels_w;
+    __device__ int device_pixels_h;
     __device__ float device_fov_conversion_factor;
-    __device__ float device_pixels_w;
-    __device__ float device_pixels_h;
+    __device__ int device_sky_pixels_w;
+    __device__ int device_sky_pixels_h;
+    __device__ const float device_sky_map_distance_squared{ 50.*50. };
 
-    __device__ void calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4]);
+    __device__ void calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4], float metric[4][4]);
     __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
     __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
     __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
+    __device__ void normaliseV(float v_func[4]);
     __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
     __device__ void readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth);
-
-    // CUDA kernels.
-    __global__ void traceImage();
 };
+
+// Run the actual raytracing loop. All the appropriate variables need to be assigned and defined before this can work (without undefined behaviour).
+// TODO: Currently only defined for a camera outside the photon sphere of the Schwarzschild metric. Make this work for general metrics
+// (i.e. some sort of event horizon-detector to terminate a photon?).
+__global__ void traceImage(unsigned char *device_sky_map)
+{
+    // This is currently intended for 8x8 thread blocks.
+    // This is used repeatedly in the main loop; share it to avoid repeated global memory reads.
+    __shared__ float squared_dist_limit;
+    // TODO: For now, the Christoffel symbols are in shared memory and will use 16 KB. Test later
+    // whether this can be moved to registers without spilling.
+    __shared__ float c_symbols[8][8][4][4][4];
+
+    if (threadIdx.x == 0 && threadIdx.y == 0)
+    {
+        squared_dist_limit = DeviceTraceTools::device_sky_map_distance_squared;
+    }
+    __syncthreads();
+
+    int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
+    int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
+
+    if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
+    {
+        // These are specific to each thread (pixel) and are used constantly; keep in register.
+        float x[4];
+        float v[4];
+        float metric[4][4];
+        for (int i { 0 }; i < 4; i++)
+        {
+            x[i] = DeviceTraceTools::device_camera_coords[i];
+        }
+        DeviceTraceTools::getMetricTensor(x, metric);
+        DeviceTraceTools::calculateStartVelocity(pixel_x, pixel_y, v, metric);
+        DeviceTraceTools::normaliseV(v);
+        // Need to pass a pointer to the start of the Christoffel symbols for this thread/pixel.
+        DeviceTraceTools::getChristoffelSymbols(x, metric, &c_symbols[threadIdx.x][threadIdx.y][0]);
+
+        // Set to true if the photon enters the photon sphere.
+        bool consumed { false };
+    }
+}
 
 // Initialise Scene object with no sky map and default camera parameters.
 void Scene::initialiseDefault(char sky_map[])
@@ -39,29 +81,31 @@ void Scene::initialiseDefault(char sky_map[])
     setCameraCoordinates((float*)&default_camera_coords);
     setCameraQuaternion((float*)&default_camera_quat);
     // Default horizontal FoV is 75 degrees.
-    setCameraFoV(75.);
+    setCameraFoV(default_fov);
+    // Default resolution of 1920x1080.
+    setCameraRes(default_width, default_height);
 }
 
 // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
 void Scene::importSkyMap(char image_path[])
 {
     // image_path should be a pointer to a C-style array of char[].
-    // This is usually too large for stack allocation, so stbi_load() returns a pointer to the array on the heap.
+    // This is usually too large for stack allocation, so host_sky_map becomes a pointer to a pixel array on the heap.
     // Force to load as RGB (3 bytes per pixel).
     host_sky_map = stbi_load(image_path, &sky_pixels_w, &sky_pixels_h, &byte_depth, 3);
     if (host_sky_map != NULL)
     {
-        num_photons = sky_pixels_w*sky_pixels_h;
-        sky_pixels_w_float = static_cast<float>(sky_pixels_w);
-        sky_pixels_h_float = static_cast<float>(sky_pixels_h);
+        num_pixels = sky_pixels_w*sky_pixels_h;
+        sky_pixels_w_f = static_cast<float>(sky_pixels_w);
+        sky_pixels_h_f = static_cast<float>(sky_pixels_h);
         phi_interval = (2.*pi_host) / sky_pixels_w;
         theta_interval = pi_host / sky_pixels_h;
 
         // Reset existing device map (if it exists), then copy the new map and related information.
-        // This cannot be allocated in initialiseDefault() because its size is not known at compile-time.
+        // This cannot be allocated in initialiseDefault() because its size is only known at run time.
         freeSkyMapDevice();
         cudaError_t err { cudaSuccess };
-        size_t map_size { sizeof(unsigned char)*num_photons*byte_depth };
+        size_t map_size { sizeof(unsigned char)*num_pixels*byte_depth };
         err = cudaMalloc((void **)&DeviceTraceTools::device_sky_map, map_size);
         if (err != cudaSuccess)
         {
@@ -73,12 +117,12 @@ void Scene::importSkyMap(char image_path[])
             throw std::runtime_error("Error: failed to copy sky map to device.");
         }
 
-        err = cudaMemcpyToSymbol(DeviceTraceTools::device_pixels_w, &sky_pixels_w_float , sizeof(float));
+        err = cudaMemcpyToSymbol(DeviceTraceTools::device_sky_pixels_w, &sky_pixels_w, sizeof(int));
         if (err != cudaSuccess)
         {
             throw std::runtime_error("Error: failed to copy sky pixel width to device.");
         }
-        err = cudaMemcpyToSymbol(DeviceTraceTools::device_pixels_h, &sky_pixels_h_float, sizeof(float));
+        err = cudaMemcpyToSymbol(DeviceTraceTools::device_sky_pixels_h, &sky_pixels_h, sizeof(int));
         if (err != cudaSuccess)
         {
             throw std::runtime_error("Error: failed to copy sky pixel height to device.");
@@ -88,6 +132,14 @@ void Scene::importSkyMap(char image_path[])
     {
         throw std::runtime_error("Error: failed to load sky map image.");
     }
+}
+
+void Scene::runTraceKernel()
+{
+    // Use 64 threads per block for now. This is mostly limited by the available shared memory to store the Christoffel symbols.
+    dim3 threadsPerBlock(8, 8);
+    dim3 numBlocks(10, 10);
+    traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map);
 }
 
 void Scene::freeSkyMapHost()
@@ -104,13 +156,31 @@ void Scene::freeSkyMapDevice()
 void Scene::setCameraFoV(float new_fov_width)
 {
     fov_width = new_fov_width;
-    fov_width_rad = fov_width * (pi_host/180.);
-    float conversion_factor = fov_width_rad / sky_pixels_w_float;
+    fov_width_rad = fov_width * (pi_host/180.f);
+    float conversion_factor = fov_width_rad / sky_pixels_w_f;
     cudaError_t err;
     err = cudaMemcpyToSymbol(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float));
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
+    }
+}
+
+// Sets the width and height resolution of the camera and copies it to the device.
+void Scene::setCameraRes(int width, int height)
+{
+    pixels_w = width;
+    pixels_h = height;
+    cudaError_t err;
+    err = cudaMemcpyToSymbol(DeviceTraceTools::device_pixels_w, &pixels_w, sizeof(int));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy camera pixel width to device.");
+    }
+    err = cudaMemcpyToSymbol(DeviceTraceTools::device_pixels_h, &pixels_h, sizeof(int));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy camera pixel height to device.");
     }
 }
 
@@ -143,12 +213,20 @@ void Scene::setCameraQuaternion(float quaternion[4])
 }
 
 // Calculates the start velocity of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
-__device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4])
+__device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4], float metric[4][4])
 {
-    float phi { (pixel_x - 0.5*DeviceTraceTools::device_pixels_w) * DeviceTraceTools::device_fov_conversion_factor };
-    float theta { (pixel_y - 0.5*DeviceTraceTools::device_pixels_h) * DeviceTraceTools::device_fov_conversion_factor + 0.5*pi_device };
-    photon_v[0] = phi;
-    photon_v[1] = theta;
+    float phi { (pixel_x - 0.5f*DeviceTraceTools::device_pixels_w) * DeviceTraceTools::device_fov_conversion_factor };
+    float theta { (pixel_y - 0.5f*DeviceTraceTools::device_pixels_h) * DeviceTraceTools::device_fov_conversion_factor + 0.5f*pi_device };
+    // Convert to Cartesian coordinates.
+    float unrotated_v[4];
+    unrotated_v[0] = 0.;
+    unrotated_v[1] = sin(theta)*cos(phi);
+    unrotated_v[2] = sin(theta)*sin(phi);
+    unrotated_v[3] = cos(theta);
+    // Rotate to align with the camera orientation.
+    rotateVecByQuat(unrotated_v, device_camera_quat, photon_v);
+    // Set the t-component to make the velocity null.
+    DeviceTraceTools::makeVNull(photon_v, metric);
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.
@@ -181,6 +259,7 @@ __device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float m
     // TODO: How do you define this adaptively to not break near areas of extreme distortion?
     // For now, just set it to a small number.
     const float step { 1e-4 };
+    const float inverse_step { 1./step };
 
     // Simple Euler forward-difference derivatives of the metric along each component.
     float metric_derivs[4][4][4];
@@ -196,7 +275,7 @@ __device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float m
         {
             for (int nu { mu }; nu < 4; nu++)
             {
-                metric_derivs[alpha][mu][nu] = metric_func[mu][nu] - metric_temp[mu][nu];
+                metric_derivs[alpha][mu][nu] = (metric_temp[mu][nu] - metric_func[mu][nu])*inverse_step;
                 metric_derivs[alpha][nu][mu] = metric_derivs[alpha][mu][nu];
             }
         }
@@ -277,6 +356,17 @@ __device__ void DeviceTraceTools::makeVNull(float v_func[4], float metric_func[4
     v_func[0] = (-b + sqrt(b*b - 4.*a*c)) / (2.*a);
 }
 
+// Makes the L2 norm of the velocity 1 for the sake of maintaining a roughly consistent affine parameter.
+// This does turn it into a "unit" velocity!
+__device__ void DeviceTraceTools::normaliseV(float v_func[4])
+{
+    float inv_norm { rnorm4df(v_func[0], v_func[1], v_func[2], v_func[3]) };
+    v_func[0] *= inv_norm;
+    v_func[1] *= inv_norm;
+    v_func[2] *= inv_norm;
+    v_func[3] *= inv_norm;
+}
+
 // TODO: This doesn't get the correct result for asymmetric matrices! Not technically important here, but it's
 // indicative that something is wrong underneath.
 __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float metric_inverse[4][4])
@@ -340,4 +430,34 @@ __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float me
 __device__ void DeviceTraceTools::readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth)
 {
     pixel = &device_sky_map[(y*sky_pixels_w + x)*byte_depth];
+}
+
+// Calculates the Hamilton (quaternionic) product of u with v.
+__device__ void hamiltonProduct(float u[4], float v[4], float result[4])
+{
+    result[0] = u[0]*v[0] - (u[1]*v[1] + u[2]*v[2] + u[3]*v[3]);
+    // Cross product of the vector components of u and v is needed.
+    float cross[3];
+    cross[0] = u[2]*v[3] - u[3]*v[2];
+    cross[1] = u[3]*v[1] - u[1]*v[3];
+    cross[2] = u[1]*v[2] - u[2]*v[1];
+    for (int i { 1 }; i < 4; i++)
+    {
+        result[i] = u[0]*v[i] + v[0]*u[i] + cross[i-1];
+    }
+}
+
+// Rotates a 3D cartesian vector, vec (given as a quaternion with no real part), by the given quaternion, rotation_quat.
+// result will be the rotated vector represented as a quaternion with no real part.
+__device__ void rotateVecByQuat(float vec[4], float rotation_quat[4], float result[4])
+{
+    // Assume that rotation_quat is normalised.
+    float rotation_quat_inverse[4];
+    rotation_quat_inverse[0] = rotation_quat[0];
+    rotation_quat_inverse[1] = -rotation_quat[1];
+    rotation_quat_inverse[2] = -rotation_quat[2];
+    rotation_quat_inverse[3] = -rotation_quat[3];
+    float intermediate_result[4];
+    hamiltonProduct(vec, rotation_quat_inverse, intermediate_result);
+    hamiltonProduct(rotation_quat, intermediate_result, result);
 }

@@ -9,13 +9,17 @@
 namespace DeviceTraceTools
 {
     // Device variables and functions.
+    // This pointer is left in host memory and assigned with cudaMemcpy because otherwise it cannot be deallocated by the host
+    // with cudaFree().
     unsigned char* device_sky_map { nullptr };
-    float *device_camera_coords { nullptr };
-    float *device_camera_quat{ nullptr };
-    float *device_fov_conversion_factor { nullptr };
-    float *device_pixels_w { nullptr };
-    float *device_pixels_h { nullptr };
-    __device__ void calculateStartVelocity(int pixel_x, int pixel_y, float photon_v[4]);
+    // Default camera coordinates are along -x and the camera faces along +x.
+    __device__ float device_camera_coords[4] { 0., -10., 0., 0. };
+    __device__ float device_camera_quat[4] { 1., 0., 0., 0. };
+    __device__ float device_fov_conversion_factor;
+    __device__ float device_pixels_w;
+    __device__ float device_pixels_h;
+
+    __device__ void calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4]);
     __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
     __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
     __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
@@ -29,37 +33,7 @@ namespace DeviceTraceTools
 // Initialise Scene object with no sky map and default camera parameters.
 void Scene::initialiseDefault(char sky_map[])
 {
-    cudaError_t err { cudaSuccess };
-    // The camera location and quaternion on the device only need to be allocated once here, then they can be copied to
-    // whenever the camera moves.
-    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_coords, sizeof(float)*4);
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to allocate memory for camera coordinates on device.");
-    }
-    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_quat, sizeof(float)*4);
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to allocate memory for camera quaternion on device.");
-    }
-    // Initialise device memory for the number of pixels and for the FoV conversion factor.
-    err = cudaMalloc((void **)&DeviceTraceTools::device_pixels_w, sizeof(float));
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to allocate memory for sky pixel width on device.");
-    }
-    err = cudaMalloc((void **)&DeviceTraceTools::device_pixels_h, sizeof(float));
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to allocate memory for sky pixel height on device.");
-    }
-    err = cudaMalloc((void **)&DeviceTraceTools::device_fov_conversion_factor, sizeof(float));
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to allocate memory for FoV conversion factor on device.");
-    }
-
-    // Note sky_map will already have decayed to a char* pointer here.
+    // Note sky_map will already have decayed to a char* pointer here; no need to convert.
     importSkyMap(sky_map);
     // Set camera quaternion to default position and orientation and copy to device.
     setCameraCoordinates((float*)&default_camera_coords);
@@ -98,12 +72,13 @@ void Scene::importSkyMap(char image_path[])
         {
             throw std::runtime_error("Error: failed to copy sky map to device.");
         }
-        err = cudaMemcpy(DeviceTraceTools::device_pixels_w, &sky_pixels_w_float, sizeof(float), cudaMemcpyHostToDevice);
+
+        err = cudaMemcpyToSymbol(DeviceTraceTools::device_pixels_w, &sky_pixels_w_float , sizeof(float));
         if (err != cudaSuccess)
         {
             throw std::runtime_error("Error: failed to copy sky pixel width to device.");
         }
-        err = cudaMemcpy(DeviceTraceTools::device_pixels_h, &sky_pixels_h_float, sizeof(float), cudaMemcpyHostToDevice);
+        err = cudaMemcpyToSymbol(DeviceTraceTools::device_pixels_h, &sky_pixels_h_float, sizeof(float));
         if (err != cudaSuccess)
         {
             throw std::runtime_error("Error: failed to copy sky pixel height to device.");
@@ -132,22 +107,22 @@ void Scene::setCameraFoV(float new_fov_width)
     fov_width_rad = fov_width * (pi_host/180.);
     float conversion_factor = fov_width_rad / sky_pixels_w_float;
     cudaError_t err;
-    err = cudaMemcpy(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float), cudaMemcpyHostToDevice);
+    err = cudaMemcpyToSymbol(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float));
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
     }
 }
 
-// When called, this will both set the host variable/pointer and copy it to DeviceTraceTools::camera_coords
-// to let the GPU access its own copy in device memory.
+// When called, this will both set the host variable and copy it to DeviceTraceTools::camera_coords
+// to let the GPU access its own copy in device memory. Same thing for setCameraQuaternion.
 void Scene::setCameraCoordinates(float x[4])
 {
     for (int i { 0 }; i < 4; i++)
     {
         camera_coords[i] = x[i];
     }
-    cudaError_t err { cudaMemcpy(DeviceTraceTools::device_camera_coords, &camera_coords, sizeof(float)*4, cudaMemcpyHostToDevice) };
+    cudaError_t err { cudaMemcpyToSymbol(DeviceTraceTools::device_camera_coords, camera_coords, sizeof(float)*4) };
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Error: failed to copy camera coordinates to device.");
@@ -160,7 +135,7 @@ void Scene::setCameraQuaternion(float quaternion[4])
     {
         camera_quat[i] = quaternion[i];
     }
-    cudaError_t err { cudaMemcpy(DeviceTraceTools::device_camera_quat, &camera_quat, sizeof(float)*4, cudaMemcpyHostToDevice) };
+    cudaError_t err { cudaMemcpyToSymbol(DeviceTraceTools::device_camera_quat, camera_quat, sizeof(float)*4) };
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Error: failed to copy camera quaternion to device.");
@@ -168,10 +143,12 @@ void Scene::setCameraQuaternion(float quaternion[4])
 }
 
 // Calculates the start velocity of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
-__device__ void DeviceTraceTools::calculateStartVelocity(int pixel_x, int pixel_y, float photon_v[4])
+__device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4])
 {
-    // float phi { -((pixel_x-0.5 * *DeviceTraceTools::device_pixels_w) * *DeviceTraceTools::device_fov_conversion_factor) };
-    // float theta { (pixel_y-0.5 * *DeviceTraceTools::device_pixels_h) * *DeviceTraceTools::device_fov_conversion_factor + 0.5*pi_device };
+    float phi { (pixel_x - 0.5*DeviceTraceTools::device_pixels_w) * DeviceTraceTools::device_fov_conversion_factor };
+    float theta { (pixel_y - 0.5*DeviceTraceTools::device_pixels_h) * DeviceTraceTools::device_fov_conversion_factor + 0.5*pi_device };
+    photon_v[0] = phi;
+    photon_v[1] = theta;
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.

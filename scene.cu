@@ -201,6 +201,7 @@ __device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pi
     rotateVecByQuat(unrotated_v, device_camera_quat, photon_v);
     // Set the t-component to make the velocity null.
     makeVNull(photon_v, metric);
+    normaliseV(photon_v);
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.

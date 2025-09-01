@@ -18,8 +18,6 @@ __device__ __constant__ float pi_device = 3.141592653589793;
 class Scene
 {
     public:
-        // Parameter step will never exceed this when evolving photons.
-        const float max_parameter_step { 5. };
         // Image parameters of the sky map (determines the number of photons to trace).
         int sky_pixels_w;
         int sky_pixels_h;

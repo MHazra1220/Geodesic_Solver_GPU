@@ -23,54 +23,13 @@ namespace DeviceTraceTools
 
     __device__ void calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4], float metric[4][4]);
     __device__ void getMetricTensor(float x_func[4], float metric_func[4][4]);
-    __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4]);
+    __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4], float metric_derivs[4][4][4]);
     __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
     __device__ void normaliseV(float v_func[4]);
     __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
+    __device__ float minkowskiDeviation(float metric[4][4]);
     __device__ void readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth);
 };
-
-// Run the actual raytracing loop. All the appropriate variables need to be assigned and defined before this can work (without undefined behaviour).
-// TODO: Currently only defined for a camera outside the photon sphere of the Schwarzschild metric. Make this work for general metrics
-// (i.e. some sort of event horizon-detector to terminate a photon?).
-__global__ void traceImage(unsigned char *device_sky_map)
-{
-    // This is currently intended for 8x8 thread blocks.
-    // This is used repeatedly in the main loop; share it to avoid repeated global memory reads.
-    __shared__ float squared_dist_limit;
-    // TODO: For now, the Christoffel symbols are in shared memory and will use 16 KB. Test later
-    // whether this can be moved to registers without spilling.
-    __shared__ float c_symbols[8][8][4][4][4];
-
-    if (threadIdx.x == 0 && threadIdx.y == 0)
-    {
-        squared_dist_limit = DeviceTraceTools::device_sky_map_distance_squared;
-    }
-    __syncthreads();
-
-    int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
-    int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
-
-    if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
-    {
-        // These are specific to each thread (pixel) and are used constantly; keep in register.
-        float x[4];
-        float v[4];
-        float metric[4][4];
-        for (int i { 0 }; i < 4; i++)
-        {
-            x[i] = DeviceTraceTools::device_camera_coords[i];
-        }
-        DeviceTraceTools::getMetricTensor(x, metric);
-        DeviceTraceTools::calculateStartVelocity(pixel_x, pixel_y, v, metric);
-        DeviceTraceTools::normaliseV(v);
-        // Need to pass a pointer to the start of the Christoffel symbols for this thread/pixel.
-        DeviceTraceTools::getChristoffelSymbols(x, metric, &c_symbols[threadIdx.x][threadIdx.y][0]);
-
-        // Set to true if the photon enters the photon sphere.
-        bool consumed { false };
-    }
-}
 
 // Initialise Scene object with no sky map and default camera parameters.
 void Scene::initialiseDefault(char sky_map[])
@@ -136,9 +95,9 @@ void Scene::importSkyMap(char image_path[])
 
 void Scene::runTraceKernel()
 {
-    // Use 64 threads per block for now. This is mostly limited by the available shared memory to store the Christoffel symbols.
-    dim3 threadsPerBlock(8, 8);
-    dim3 numBlocks(10, 10);
+    // Use 32 threads per block for now. This is mostly limited by the available shared memory to store the Christoffel symbols and metric derivatives.
+    dim3 threadsPerBlock(8, 4);
+    dim3 numBlocks(240, 270);
     traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map);
 }
 
@@ -215,8 +174,8 @@ void Scene::setCameraQuaternion(float quaternion[4])
 // Calculates the start velocity of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
 __device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4], float metric[4][4])
 {
-    float phi { (pixel_x - 0.5f*DeviceTraceTools::device_pixels_w) * DeviceTraceTools::device_fov_conversion_factor };
-    float theta { (pixel_y - 0.5f*DeviceTraceTools::device_pixels_h) * DeviceTraceTools::device_fov_conversion_factor + 0.5f*pi_device };
+    float phi { (pixel_x - 0.5f*device_pixels_w) * device_fov_conversion_factor };
+    float theta { (pixel_y - 0.5f*device_pixels_h) * device_fov_conversion_factor + 0.5f*pi_device };
     // Convert to Cartesian coordinates.
     float unrotated_v[4];
     unrotated_v[0] = 0.;
@@ -226,7 +185,7 @@ __device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pi
     // Rotate to align with the camera orientation.
     rotateVecByQuat(unrotated_v, device_camera_quat, photon_v);
     // Set the t-component to make the velocity null.
-    DeviceTraceTools::makeVNull(photon_v, metric);
+    makeVNull(photon_v, metric);
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.
@@ -253,7 +212,7 @@ __device__ void DeviceTraceTools::getMetricTensor(float x_func[4], float metric_
     metric_func[3][3] += 1.;
 }
 
-__device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4])
+__device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4], float metric_derivs[4][4][4])
 {
     // Assumed default step in each coordinate.
     // TODO: How do you define this adaptively to not break near areas of extreme distortion?
@@ -262,7 +221,6 @@ __device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float m
     const float inverse_step { 1./step };
 
     // Simple Euler forward-difference derivatives of the metric along each component.
-    float metric_derivs[4][4][4];
     float metric_temp[4][4];
     for (int alpha { 0 }; alpha < 4; alpha++)
     {
@@ -311,6 +269,7 @@ __device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float m
             for (int nu { mu }; nu < 4; nu++)
             {
                 float component[4];
+                #pragma unroll
                 for (int gamma { 0 }; gamma < 4; gamma++)
                 {
                     component[gamma] = metric_derivs[nu][mu][gamma] + metric_derivs[mu][nu][gamma] - metric_derivs[gamma][mu][nu];
@@ -407,6 +366,7 @@ __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float me
             {
                 metric_func[j][k] -= multiplier*metric_func[i][k];
             }
+            #pragma unroll
             for (int k { 0 }; k < 4; k++)
             {
                 metric_inverse[j][k] -= multiplier*metric_inverse[i][k];
@@ -419,6 +379,7 @@ __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float me
     {
         multiplier = 1./metric_func[i][i];
         metric_func[i][i] = 1.;
+        #pragma unroll
         for (int k { 0 }; k < 4; k++)
         {
             metric_inverse[i][k] *= multiplier;
@@ -426,10 +387,98 @@ __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float me
     }
 }
 
+// Crude way of testing how distorted the metric is from the Minkowski metric without resorting to the Riemann tensor.
+// Used for adaptive step size. This only works in (t, x, y, z) coordinates.
+__device__ float minkowskiDeviation(float metric[4][4])
+{
+    // "Normalise" against things that scale the whole metric but introduce no curvature.
+    float scale_factor { 0. };
+    #pragma unroll
+    for (int i { 0 }; i < 4; i++)
+    {
+        scale_factor += fabs(metric[i][i]);
+    }
+    scale_factor *= 0.25;
+    scale_factor = 1./scale_factor;
+
+    // Subtract the Minkowski metric from the scaled metric and add up all the absolute components.
+    float deviation { 0. };
+    deviation += fabs(metric[0][0]*scale_factor + 1.);
+    #pragma unroll
+    for (int i { 1 }; i < 4; i++)
+    {
+        // Diagonal components.
+        deviation += fabs(metric[i][i] - 1.);
+    }
+    for (int i { 0 }; i < 3; i++)
+    {
+        for (int j { i+1 }; j < 4; j++)
+        {
+            // Off-diagonal components.
+            deviation += 2.*fabs(metric[i][j]);
+        }
+    }
+
+    // A value of 0 implies no curvature. More positive values imply more curvature (but it won't tell you how).
+    return deviation;
+}
+
 // Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
 __device__ void DeviceTraceTools::readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth)
 {
     pixel = &device_sky_map[(y*sky_pixels_w + x)*byte_depth];
+}
+
+// Run the actual raytracing loop. All the appropriate variables need to be assigned and defined before this can work (without undefined behaviour).
+// TODO: Currently only defined for a camera outside the photon sphere of the Schwarzschild metric. Make this work for general metrics
+// (i.e. some sort of event horizon-detector to terminate a photon?).
+__global__ void traceImage(unsigned char *device_sky_map)
+{
+    // This is currently intended for 8x4 thread blocks.
+    // TODO: For now, the Christoffel symbols are in shared memory and will use 8 KiB. Test later
+    // whether they can be moved to registers without spilling for a significant speed boost.
+    // Same thing for the metric derivative components.
+    __shared__ float c_symbols[8][4][4][4][4];
+    __shared__ float metric_derivs[8][4][4][4][4];
+
+    int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
+    int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
+
+    if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
+    {
+        float x[4];
+        float v[4];
+        float metric[4][4];
+        #pragma unroll
+        for (int i { 0 }; i < 4; i++)
+        {
+            x[i] = DeviceTraceTools::device_camera_coords[i];
+        }
+
+        DeviceTraceTools::getMetricTensor(x, metric);
+        DeviceTraceTools::calculateStartVelocity(pixel_x, pixel_y, v, metric);
+        DeviceTraceTools::normaliseV(v);
+        // Need to pass a pointer to the start of the Christoffel symbols for this thread/pixel.
+        DeviceTraceTools::getChristoffelSymbols(x, metric, &c_symbols[threadIdx.x][threadIdx.y][0], &metric_derivs[threadIdx.x][threadIdx.y][0]);
+
+        // Set to true if the photon enters the photon sphere.
+        bool consumed { false };
+        float sky_dist_squared { DeviceTraceTools::device_sky_map_distance_squared };
+        float dist_squared { x[1]*x[1] + x[2]*x[2] + x[3]*x[3] };
+        while (dist_squared < sky_dist_squared)
+        {
+            if (dist_squared < 2.25)
+            {
+                // Entered the photon radius if true; terminate the photon.
+                consumed = true;
+                break;
+            }
+            // Otherwise, advance the simulation with RK4.
+            // TODO: write RK4 routine.
+
+            dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+        }
+    }
 }
 
 // Calculates the Hamilton (quaternionic) product of u with v.

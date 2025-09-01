@@ -201,7 +201,6 @@ __device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pi
     rotateVecByQuat(unrotated_v, device_camera_quat, photon_v);
     // Set the t-component to make the velocity null.
     makeVNull(photon_v, metric);
-    normaliseV(photon_v);
 }
 
 // Currently defined to return the Schwarzschild metric with a Schwarzschild radius of 1.
@@ -590,8 +589,6 @@ __global__ void traceImage(unsigned char *device_sky_map)
         DeviceTraceTools::getMetricTensor(x, metric);
         DeviceTraceTools::calculateStartVelocity(pixel_x, pixel_y, v, metric);
         DeviceTraceTools::normaliseV(v);
-        // Need to pass a pointer to the start of the Christoffel symbols for this thread/pixel.
-        DeviceTraceTools::getChristoffelSymbols(x, metric, &c_symbols[threadIdx.x][threadIdx.y][0], &metric_derivs[threadIdx.x][threadIdx.y][0]);
 
         // Set to true if the photon enters the photon sphere.
         bool consumed { false };

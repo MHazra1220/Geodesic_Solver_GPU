@@ -2,7 +2,6 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <stdexcept>
-#include <iostream>
 
 // These objects and functions are used by the GPU when tracing photons. They are defined outside Scene
 // in a separate namespace so that the GPU doesn't need a copy of the entire Scene object in device memory when calculating paths.
@@ -10,8 +9,10 @@ namespace DeviceTraceTools
 {
     // Device variables and functions.
     // This pointer is left in host memory and assigned with cudaMemcpy because otherwise it cannot be deallocated by the host
-    // with cudaFree().
+    // with cudaFree(). This points to the sky map in device memory.
     unsigned char *device_sky_map { nullptr };
+    // This points to the pixel array for the camera in device memory.
+    unsigned char *device_camera_pixel_array { nullptr };
     // Default camera coordinates are along -x and the camera faces along +x.
     __device__ float device_camera_coords[4] { 0., -10., 0., 0. };
     __device__ float device_camera_quat[4] { 1., 0., 0., 0. };
@@ -56,7 +57,6 @@ void Scene::importSkyMap(char image_path[])
     host_sky_map = stbi_load(image_path, &sky_pixels_w, &sky_pixels_h, &byte_depth, 3);
     if (host_sky_map != NULL)
     {
-        num_pixels = sky_pixels_w*sky_pixels_h;
         sky_pixels_w_f = static_cast<float>(sky_pixels_w);
         sky_pixels_h_f = static_cast<float>(sky_pixels_h);
         phi_interval = (2.*pi_host) / sky_pixels_w;
@@ -64,13 +64,13 @@ void Scene::importSkyMap(char image_path[])
 
         // Reset existing device map (if it exists), then copy the new map and related information.
         // This cannot be allocated in initialiseDefault() because its size is only known at run time.
-        freeSkyMapDevice();
+        cudaFree(DeviceTraceTools::device_sky_map);
         cudaError_t err { cudaSuccess };
-        size_t map_size { sizeof(unsigned char)*num_pixels*byte_depth };
+        size_t map_size { sizeof(unsigned char)*sky_pixels_w*sky_pixels_h*byte_depth };
         err = cudaMalloc((void **)&DeviceTraceTools::device_sky_map, map_size);
         if (err != cudaSuccess)
         {
-            throw std::runtime_error("Error: failed to allocate sky map memory on device.");
+            throw std::runtime_error("Error: failed to allocate memory for sky map on device.");
         }
         err = cudaMemcpy(DeviceTraceTools::device_sky_map, host_sky_map, map_size, cudaMemcpyHostToDevice);
         if (err != cudaSuccess)
@@ -111,19 +111,20 @@ void Scene::runTraceKernel()
     {
         num_blocks_y += 1;
     }
-    std::cout << num_blocks_x << "\t" << num_blocks_y << "\n";
     dim3 numBlocks(num_blocks_x, num_blocks_y);
     traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map);
 }
 
-void Scene::freeSkyMapHost()
+void Scene::freeHostPixelArrays()
 {
     stbi_image_free(host_sky_map);
+    free(host_camera_pixel_array);
 }
 
-void Scene::freeSkyMapDevice()
+void Scene::freeDevicePixelArrays()
 {
     cudaFree(DeviceTraceTools::device_sky_map);
+    cudaFree(DeviceTraceTools::device_camera_pixel_array);
 }
 
 // Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
@@ -155,6 +156,19 @@ void Scene::setCameraRes(int width, int height)
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Error: failed to copy camera pixel height to device.");
+    }
+    // Allocate memory for the camera pixel array.
+    free(host_camera_pixel_array);
+    cudaFree(DeviceTraceTools::device_camera_pixel_array);
+    host_camera_pixel_array = (unsigned char*)malloc(sizeof(unsigned char)*pixels_w*pixels_h);
+    if (host_camera_pixel_array == nullptr)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for camera pixel array on host.");
+    }
+    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_pixel_array, sizeof(unsigned char)*pixels_w*pixels_h);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to allocate memory for camera pixel array on device.");
     }
 }
 

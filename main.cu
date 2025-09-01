@@ -39,8 +39,8 @@ int main()
     Scene scene_test;
     scene_test.initialiseDefault(sky_map);
     scene_test.runTraceKernel();
-    scene_test.freeSkyMapHost();
-    scene_test.freeSkyMapDevice();
+    scene_test.freeHostPixelArrays();
+    scene_test.freeDevicePixelArrays();
 
     return 0;
 }

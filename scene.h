@@ -24,7 +24,6 @@ class Scene
         // Float versions are useful for calculation when sampling pixels from the sky map.
         float sky_pixels_w_f;
         float sky_pixels_h_f;
-        int num_pixels;
         // Interval of phi and theta in radians between each pixel of the sky map.
         float phi_interval;
         float theta_interval;
@@ -52,8 +51,8 @@ class Scene
         // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
         void importSkyMap(char image_path[]);
         void runTraceKernel();
-        void freeSkyMapHost();
-        void freeSkyMapDevice();
+        void freeHostPixelArrays();
+        void freeDevicePixelArrays();
 
     private:
         const float default_camera_coords[4] { 0., -10., 0., 0. };
@@ -64,8 +63,9 @@ class Scene
         // Default resolution.
         const int default_width { 1920 };
         const int default_height { 1080 };
-        // Pointer to the pixel array of the sky map.
-        unsigned char* host_sky_map { nullptr };
+        // Pointer to the pixel array of the sky map and camera image on the host.
+        unsigned char *host_sky_map { nullptr };
+        unsigned char *host_camera_pixel_array { nullptr };
 
         // ------------- Function forward declarations.
         void setSkyMapDistance(float sky_distance);

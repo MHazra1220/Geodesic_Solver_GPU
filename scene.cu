@@ -2,6 +2,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <stdexcept>
+#include <iostream>
 
 // These objects and functions are used by the GPU when tracing photons. They are defined outside Scene
 // in a separate namespace so that the GPU doesn't need a copy of the entire Scene object in device memory when calculating paths.
@@ -27,7 +28,8 @@ namespace DeviceTraceTools
     __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
     __device__ void normaliseV(float v_func[4]);
     __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
-    __device__ float minkowskiDeviation(float metric[4][4]);
+    __device__ float calculateParameterStep(float metric[4][4]);
+    __device__ void advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4]);
     __device__ void readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth);
 };
 
@@ -96,8 +98,21 @@ void Scene::importSkyMap(char image_path[])
 void Scene::runTraceKernel()
 {
     // Use 32 threads per block for now. This is mostly limited by the available shared memory to store the Christoffel symbols and metric derivatives.
+    // Use smaller blocks also allows the scheduler to naturally load-balance against the fact that pixels looking into the black hole probably require
+    // more computation.
     dim3 threadsPerBlock(8, 4);
-    dim3 numBlocks(240, 270);
+    int num_blocks_x { pixels_w / 8 };
+    int num_blocks_y { pixels_h / 4 };
+    if (pixels_w % 8 > 0)
+    {
+        num_blocks_x += 1;
+    }
+    if (pixels_h % 4 > 0)
+    {
+        num_blocks_y += 1;
+    }
+    std::cout << num_blocks_x << "\t" << num_blocks_y << "\n";
+    dim3 numBlocks(num_blocks_x, num_blocks_y);
     traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map);
 }
 
@@ -389,7 +404,7 @@ __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float me
 
 // Crude way of testing how distorted the metric is from the Minkowski metric without resorting to the Riemann tensor.
 // Used for adaptive step size. This only works in (t, x, y, z) coordinates.
-__device__ float minkowskiDeviation(float metric[4][4])
+__device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
 {
     // "Normalise" against things that scale the whole metric but introduce no curvature.
     float scale_factor { 0. };
@@ -408,19 +423,135 @@ __device__ float minkowskiDeviation(float metric[4][4])
     for (int i { 1 }; i < 4; i++)
     {
         // Diagonal components.
-        deviation += fabs(metric[i][i] - 1.);
+        deviation += fabs(metric[i][i]*scale_factor - 1.);
     }
     for (int i { 0 }; i < 3; i++)
     {
         for (int j { i+1 }; j < 4; j++)
         {
             // Off-diagonal components.
-            deviation += 2.*fabs(metric[i][j]);
+            deviation += 2.*fabs(metric[i][j]*scale_factor);
         }
     }
 
-    // A value of 0 implies no curvature. More positive values imply more curvature (but it won't tell you how).
-    return deviation;
+    if (deviation == 0)
+    {
+        // Metric is flat; set to the maximum step size.
+        return 5.;
+    }
+    else
+    {
+        float dl;
+        // This is designed to give reasonable stability for 2-3 orbits on the photon sphere of a Schwarzschild black hole of radius 1.
+        dl = 1e-1 * (9./(deviation*deviation));
+        if (dl > 5.)
+        {
+            // Too large; set to max parameter step.
+            dl = 5.;
+        }
+        else
+        {
+            return dl;
+        }
+    }
+}
+
+// Advances a photon/pixel with an adaptive timestep using RK4.
+__device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4])
+{
+    // Calculate parameter step.
+    float dl { calculateParameterStep(metric) };
+    float mult_factor { dl/6.f };
+
+    // Currently advances with RK4.
+    // WARNING: Potential register spilling here; this requires a lot of memory.
+    float x_step[4];
+    float v_step[4];
+    float x_temp[4];
+    float v_temp[4];
+    float k_n_minus_1_x[4];
+    float k_n_x[4];
+    float k_n_minus_1_v[4];
+    float k_n_v[4];
+
+    // Calculate k_1.
+    getChristoffelSymbols(x, metric, c_symbols, metric_derivs);
+    for (int i { 0 }; i < 4; i++)
+    {
+        k_n_x[i] = v[i];
+        for (int j { 0 }; j < 4; j++)
+        {
+            #pragma unroll
+            for (int k { 0 }; k < 4; k++)
+            {
+                k_n_v[i] -= c_symbols[i][j][k]*v[j]*v[k];
+            }
+        }
+        x_step[i] = k_n_x[i];
+        v_step[i] = k_n_v[i];
+    }
+
+    // Calculate k_2 and k_3.
+    for (int u { 0 }; u < 2; u++)
+    {
+        #pragma unroll
+        for (int i { 0 }; i < 4; i++)
+        {
+            k_n_minus_1_x[i] = k_n_x[i];
+            k_n_minus_1_v[i] = k_n_v[i];
+            x_temp[i] = x[i] + 0.5*dl*k_n_minus_1_x[i];
+            v_temp[i] = v[i] + 0.5*dl*k_n_minus_1_v[i];
+        }
+        // Overwrite metric to avoid allocating another 16 floats.
+        getMetricTensor(x_temp, metric);
+        getChristoffelSymbols(x_temp, metric, c_symbols, metric_derivs);
+        for (int i { 0 }; i < 4; i++)
+        {
+            k_n_x[i] = v[i] + 0.5*dl*k_n_minus_1_v[i];
+            for (int j { 0 }; j < 4; j++)
+            {
+                #pragma unroll
+                for (int k { 0 }; k < 4; k++)
+                {
+                    k_n_v[i] -= c_symbols[i][j][k]*v_temp[j]*v_temp[k];
+                }
+            }
+            x_step[i] += 2.*k_n_x[i];
+            v_step[i] += 2.*k_n_v[i];
+        }
+    }
+
+    // Calculate k_4.
+    #pragma unroll
+    for (int i { 0 }; i < 4; i++)
+    {
+        k_n_minus_1_x[i] = k_n_x[i];
+        k_n_minus_1_v[i] = k_n_v[i];
+        x_temp[i] = x[i] + dl*k_n_minus_1_x[i];
+        v_temp[i] = v[i] + dl*k_n_minus_1_v[i];
+    }
+    getMetricTensor(x_temp, metric);
+    getChristoffelSymbols(x_temp, metric, c_symbols, metric_derivs);
+    for (int i { 0 }; i < 4; i++)
+    {
+        k_n_x[i] = v[i] + dl*k_n_minus_1_v[i];
+        for (int j { 0 }; j < 4; j++)
+        {
+            #pragma unroll
+            for (int k { 0 }; k < 4; k++)
+            {
+                k_n_v[i] -= c_symbols[i][j][k]*v_temp[j]*v_temp[k];
+            }
+        }
+        x_step[i] += k_n_x[i];
+        v_step[i] += k_n_v[i];
+
+        // Advance x and v.
+        x[i] += mult_factor*x_step[i];
+        v[i] += mult_factor*v_step[i];
+    }
+    // Update metric to get it ready for the next step.
+    getMetricTensor(x, metric);
 }
 
 // Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
@@ -474,8 +605,7 @@ __global__ void traceImage(unsigned char *device_sky_map)
                 break;
             }
             // Otherwise, advance the simulation with RK4.
-            // TODO: write RK4 routine.
-
+            DeviceTraceTools::advance(x, v, metric, &c_symbols[threadIdx.x][threadIdx.y][0], &metric_derivs[threadIdx.x][threadIdx.y][0]);
             dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
         }
     }

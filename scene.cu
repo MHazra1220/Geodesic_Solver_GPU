@@ -32,7 +32,7 @@ namespace DeviceTraceTools
     __device__ void getChristoffelSymbols(float x_func[4], float metric_func[4][4], float c_symbols_func[4][4][4], float metric_derivs[4][4][4]);
     __device__ void makeVNull(float v_func[4], float metric_func[4][4]);
     __device__ void normaliseV(float v_func[4]);
-    __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
+    __host__ __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
     __device__ float calculateParameterStep(float metric[4][4]);
     __device__ void advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4]);
 };
@@ -288,7 +288,8 @@ __device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float m
         getMetricTensor(x_func, metric_temp);
         for (int mu { 0 }; mu < 4; mu++)
         {
-            for (int nu { mu }; nu < 4; nu++)
+            metric_derivs[alpha][mu][mu] = (metric_temp[mu][mu] - metric_func[mu][mu])*inverse_step;
+            for (int nu { mu+1 }; nu < 4; nu++)
             {
                 metric_derivs[alpha][mu][nu] = (metric_temp[mu][nu] - metric_func[mu][nu])*inverse_step;
                 metric_derivs[alpha][nu][mu] = metric_derivs[alpha][mu][nu];
@@ -301,17 +302,11 @@ __device__ void DeviceTraceTools::getChristoffelSymbols(float x_func[4], float m
     // Set metric_temp to the identity matrix first.
     for (int mu { 0 }; mu < 4; mu++)
     {
-        for (int nu { mu }; nu < 4; nu++)
+        metric_temp[mu][mu] = 1.;
+        for (int nu { mu+1 }; nu < 4; nu++)
         {
-            if (mu == nu)
-            {
-                metric_temp[mu][nu] = 1.;
-            }
-            else
-            {
-                metric_temp[mu][nu] = 0.;
-                metric_temp[nu][mu] = 0.;
-            }
+            metric_temp[mu][nu] = 0.;
+            metric_temp[nu][mu] = 0.;
         }
     }
     // Store the inverse metric into metric_temp. metric_func is now useless
@@ -385,7 +380,7 @@ __device__ void DeviceTraceTools::normaliseV(float v_func[4])
 
 // TODO: This doesn't get the correct result for asymmetric matrices! Not technically important here, but it's
 // indicative that something is wrong underneath.
-__device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float metric_inverse[4][4])
+__host__ __device__ void DeviceTraceTools::invertMetric(float metric_func[4][4], float metric_inverse[4][4])
 {
     // Assume that that there are no zeros on the diagonal of metric_func and that metric_inverse is currently the identity matrix.
     // Invert with forward and backward-propagation (i.e. LU-decomposition). metric_func and metric_temp are both overwritten to avoid memory allocation.
@@ -464,7 +459,7 @@ __device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
     #pragma unroll
     for (int i { 1 }; i < 4; i++)
     {
-        // Diagonal components.
+        // Spatial diagonal components.
         deviation += fabs(metric[i][i]*scale_factor - 1.);
     }
     for (int i { 0 }; i < 3; i++)
@@ -526,10 +521,10 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
         k_n_v[i] = 0;
         for (int j { 0 }; j < 4; j++)
         {
-            #pragma unroll
-            for (int k { 0 }; k < 4; k++)
+            k_n_v[i] -= c_symbols[i][j][j]*v[j]*v[j];
+            for (int k { j+1 }; k < 4; k++)
             {
-                k_n_v[i] -= c_symbols[i][j][k]*v[j]*v[k];
+                k_n_v[i] -= 2.*c_symbols[i][j][k]*v[j]*v[k];
             }
         }
         x_step[i] = k_n_x[i];
@@ -556,10 +551,10 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
             k_n_v[i] = 0;
             for (int j { 0 }; j < 4; j++)
             {
-                #pragma unroll
-                for (int k { 0 }; k < 4; k++)
+                k_n_v[i] -= c_symbols[i][j][j]*v_temp[j]*v_temp[j];
+                for (int k { j+1 }; k < 4; k++)
                 {
-                    k_n_v[i] -= c_symbols[i][j][k]*v_temp[j]*v_temp[k];
+                    k_n_v[i] -= 2.*c_symbols[i][j][k]*v_temp[j]*v_temp[k];
                 }
             }
             x_step[i] += 2.*k_n_x[i];
@@ -584,8 +579,8 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
         k_n_v[i] = 0.;
         for (int j { 0 }; j < 4; j++)
         {
-            #pragma unroll
-            for (int k { 0 }; k < 4; k++)
+            k_n_v[i] -= c_symbols[i][j][j]*v_temp[j]*v_temp[j];
+            for (int k { j+1 }; k < 4; k++)
             {
                 k_n_v[i] -= c_symbols[i][j][k]*v_temp[j]*v_temp[k];
             }
@@ -608,7 +603,7 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
 {
     // This is currently intended for 8x4 thread blocks.
     // TODO: For now, the Christoffel symbols and metric derivatives are currently in shared memory and will use
-    // 512 bytes. This does fit on the register on my GPU (5070 Ti), but I think this will probably cause register
+    // 512 bytes. This does fit on the register on my GPU (RTX 5070 Ti), but I think this will probably cause register
     // spilling on less powerful GPUs. To be safe, keep them in shared for now.
     __shared__ float c_symbols[8][4][4][4][4];
     __shared__ float metric_derivs[8][4][4][4][4];

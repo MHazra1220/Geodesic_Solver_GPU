@@ -33,7 +33,7 @@ class Scene
         // Once a photon reaches this distance, use its spatial velocity to extend it to infinity,
         // find its polar and azimuthal angles and get the appropriate pixel sky map.
         // TODO: a check is needed to make sure the camera never goes beyond this radius.
-        const float sky_map_distance { 50. };
+        const float sky_map_distance { 40. };
         const float sky_map_distance_squared { sky_map_distance*sky_map_distance };
         // Camera FoV width in degrees and radians.
         float fov_width;

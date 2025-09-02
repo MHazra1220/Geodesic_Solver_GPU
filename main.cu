@@ -35,7 +35,7 @@ int main()
     // // Free device memory.
     // err = cudaFree(device_photons);
 
-    char sky_map[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/sky_box_samples/full_milky_way.jpg" };
+    char sky_map[] { "/media/mh2001/SSD2/Programming/General_Relativity/Geodesic_Solver_GPU/sky_box_samples/full_milky_way.jpg" };
     Scene scene_test;
     scene_test.initialiseDefault(sky_map);
     float pos[4] { 0., 20, 0., 0. };
@@ -45,7 +45,7 @@ int main()
     scene_test.setCameraRes(1920, 1080);
     scene_test.setCameraFoV(90.);
     scene_test.runTraceKernel();
-    char output_image[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/output_images/GPU_test.jpg" };
+    char output_image[] { "/media/mh2001/SSD2/Programming/General_Relativity/Geodesic_Solver_GPU/output_images/GPU_test.jpg" };
     scene_test.writeCameraImage(output_image);
     scene_test.freeHostPixelArrays();
     scene_test.freeDevicePixelArrays();

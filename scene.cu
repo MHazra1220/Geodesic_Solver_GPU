@@ -117,20 +117,20 @@ void Scene::runTraceKernel()
     // Use 32 threads per block for now. This is mostly limited by the available shared memory to store the Christoffel symbols and metric derivatives.
     // Use smaller blocks also allows the scheduler to naturally load-balance against the fact that pixels looking into the black hole probably require
     // more computation.
-    dim3 threadsPerBlock(8, 8);
+    dim3 threadsPerBlock(8, 4);
     int num_blocks_x { pixels_w / 8 };
-    int num_blocks_y { pixels_h / 8 };
+    int num_blocks_y { pixels_h / 4 };
     if (pixels_w % 8 > 0)
     {
         num_blocks_x += 1;
     }
-    if (pixels_h % 8 > 0)
+    if (pixels_h % 4 > 0)
     {
         num_blocks_y += 1;
     }
     dim3 numBlocks(num_blocks_x, num_blocks_y);
     // cudaProfilerStart();
-    for (int i { 0 }; i < 10; i++)
+    for (int i { 0 }; i < 50; i++)
     {
         traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map, DeviceTraceTools::device_camera_pixel_array);
     }
@@ -608,12 +608,12 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
 // (i.e. some sort of event horizon-detector to terminate a photon?).
 __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_camera_pixel_array)
 {
-    // This is currently intended for 8x4 thread blocks.
+    // This is currently intended for 8x4 thread blocks (small warps to help reduce warp divergence in raytracing).
     // TODO: For now, the Christoffel symbols and metric derivatives are currently in shared memory and will use
     // 512 bytes. This does fit on the register on my GPU (RTX 5070 Ti), but I think this will probably cause register
     // spilling on less powerful GPUs. To be safe, keep them in shared for now.
-    __shared__ float c_symbols[8][8][4][4][4];
-    __shared__ float metric_derivs[8][8][4][4][4];
+    __shared__ float c_symbols[8][4][4][4][4];
+    __shared__ float metric_derivs[8][4][4][4][4];
 
     int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
     int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
@@ -651,28 +651,20 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
             dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
         }
 
+        // Some warp divergence is inevitable in the while loop above; sync here to bring them all back in line.
+        __syncwarp();
+
         // Sample the sky map by taking the photon to infinity (use only the velocity).
         float phi { atan2(v[2], v[1]) };
-        if (phi < 0.)
-        {
-            // Get into the range 0 to 2pi.
-            phi += 2.*pi_device;
-        }
+        // Get into the range 0 to 2pi if phi is negative.
+        phi += 2.*pi_device*(phi < 0.);
+
         float theta { acos(v[3] * rnorm3df(v[1], v[2], v[3])) };
         // Convert to pixel locations on the sky map; floor the number.
         // Because phi goes anticlockwise, 2.*pi - phi is needed here to
         // stop images being reversed along phi.
         int sky_x { (int)((2.*pi_device-phi) / DeviceTraceTools::phi_interval) };
         int sky_y { (int)(theta / DeviceTraceTools::theta_interval) };
-        // These if statements stop errors when the ray is exactly along the +x or +z axis.
-        if (sky_x >= DeviceTraceTools::device_sky_pixels_w)
-        {
-            sky_x = DeviceTraceTools::device_sky_pixels_w - 1;
-        }
-        if (sky_y >= DeviceTraceTools::device_sky_pixels_h)
-        {
-            sky_y = DeviceTraceTools::device_sky_pixels_h - 1;
-        }
         // Get pixel colour.
         unsigned char *colour { &device_sky_map[3*(sky_y*DeviceTraceTools::device_sky_pixels_w + sky_x)] };
         #pragma unroll

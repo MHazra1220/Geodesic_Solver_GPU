@@ -45,7 +45,7 @@ int main()
     scene_test.setCameraRes(2560, 1440);
     scene_test.setCameraFoV(90.);
     scene_test.runTraceKernel();
-    char output_image[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/output_images/GPU_test.jpg" };
+    char output_image[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/output_images/GPU_test_2.jpg" };
     scene_test.writeCameraImage(output_image);
     scene_test.freeHostPixelArrays();
     scene_test.freeDevicePixelArrays();

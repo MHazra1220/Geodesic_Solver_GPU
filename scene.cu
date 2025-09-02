@@ -486,14 +486,14 @@ __device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
         float dl;
         // This is designed to give reasonable stability for 1 or 2 orbits on the photon sphere of a Schwarzschild black hole of radius 1.
         dl = 1e-1 * (8./(deviation*deviation));
-        if (dl > 5.)
+        if (dl < 5.)
         {
-            // Too large; set to max parameter step.
-            return 5.;
+            return dl;
         }
         else
         {
-            return dl;
+            // Too large; set to max parameter step.
+            return 5.;
         }
     }
 }
@@ -518,6 +518,7 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
     float k_n_v[4];
 
     // Calculate k_1.
+    // The metric tensor should already be calculated for the current location.
     getChristoffelSymbols(x, metric, c_symbols, metric_derivs);
     for (int i { 0 }; i < 4; i++)
     {
@@ -606,9 +607,9 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
 __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_camera_pixel_array)
 {
     // This is currently intended for 8x4 thread blocks.
-    // TODO: For now, the Christoffel symbols are in shared memory and will use 8 KiB. Test later
-    // whether they can be moved to registers without spilling for a significant speed boost.
-    // Same thing for the metric derivative components.
+    // TODO: For now, the Christoffel symbols and metric derivatives are currently in shared memory and will use
+    // 512 bytes. This does fit on the register on my GPU (5070 Ti), but I think this will probably cause register
+    // spilling on less powerful GPUs. To be safe, keep them in shared for now.
     __shared__ float c_symbols[8][4][4][4][4];
     __shared__ float metric_derivs[8][4][4][4][4];
 
@@ -632,7 +633,7 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
         DeviceTraceTools::calculateStartVelocity(static_cast<float>(pixel_x), static_cast<float>(pixel_y), v, metric);
         DeviceTraceTools::normaliseV(v);
 
-        // Set to true if the photon enters the photon sphere.
+        // Set consumed to true if the photon enters the photon sphere.
         float sky_dist_squared = DeviceTraceTools::device_sky_map_distance_squared;
         float dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
         while (dist_squared < sky_dist_squared)
@@ -657,19 +658,19 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
         }
         else
         {
-            // Sample the sky map by taking the photon to infinity.
-            float phi { atan2f(v[2], v[1]) };
+            // Sample the sky map by taking the photon to infinity (use only the velocity).
+            float phi { atan2(v[2], v[1]) };
             if (phi < 0.)
             {
                 // Get into the range 0 to 2pi.
                 phi += 2.*pi_device;
             }
-            float theta { acosf(v[3] * rnorm3df(v[1], v[2], v[3])) };
+            float theta { acos(v[3] * rnorm3df(v[1], v[2], v[3])) };
             // Convert to pixel locations on the sky map; floor the number.
             // Because phi goes anticlockwise, 2.*pi - phi is needed here to
             // stop images being reversed along phi.
-            int sky_x { (int)floor((2.*pi_device-phi) / DeviceTraceTools::phi_interval) };
-            int sky_y { (int)floor(theta / DeviceTraceTools::theta_interval) };
+            int sky_x { (int)((2.*pi_device-phi) / DeviceTraceTools::phi_interval) };
+            int sky_y { (int)(theta / DeviceTraceTools::theta_interval) };
             // These if statements stop errors when the ray is exactly along the +x or +z axis.
             if (sky_x >= DeviceTraceTools::device_sky_pixels_w)
             {

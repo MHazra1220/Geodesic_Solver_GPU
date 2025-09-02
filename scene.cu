@@ -450,8 +450,7 @@ __device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
     {
         scale_factor += fabs(metric[i][i]);
     }
-    scale_factor *= 0.25;
-    scale_factor = 1./scale_factor;
+    scale_factor = 4./scale_factor;
 
     // Subtract the Minkowski metric from the scaled metric and add up all the absolute components.
     float deviation { 0. };

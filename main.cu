@@ -38,11 +38,11 @@ int main()
     char sky_map[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/sky_box_samples/full_milky_way.jpg" };
     Scene scene_test;
     scene_test.initialiseDefault(sky_map);
-    float pos[4] { 0., -20, 0., 0. };
-    float quat[4] { 1., 0., 0., 0. };
+    float pos[4] { 0., 20, 0., 0. };
+    float quat[4] { 0., 0., 0., 1. };
     scene_test.setCameraCoordinates(pos);
     scene_test.setCameraQuaternion(quat);
-    scene_test.setCameraRes(1920, 1080);
+    scene_test.setCameraRes(2560, 1440);
     scene_test.setCameraFoV(90.);
     scene_test.runTraceKernel();
     char output_image[] { "/media/mh2001/SSD2/Programming/General Relativity/Geodesic_Solver_GPU/output_images/GPU_test.jpg" };

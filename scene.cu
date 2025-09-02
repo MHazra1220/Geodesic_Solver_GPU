@@ -23,6 +23,8 @@ namespace DeviceTraceTools
     __device__ float device_fov_conversion_factor;
     __device__ int device_sky_pixels_w;
     __device__ int device_sky_pixels_h;
+    __device__ float phi_interval;
+    __device__ float theta_interval;
     __device__ const float device_sky_map_distance_squared{ 50.*50. };
 
     __device__ void calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4], float metric[4][4]);
@@ -33,7 +35,6 @@ namespace DeviceTraceTools
     __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
     __device__ float calculateParameterStep(float metric[4][4]);
     __device__ void advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4]);
-    __device__ void readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth);
 };
 
 // Initialise Scene object with no sky map and default camera parameters.
@@ -46,7 +47,7 @@ void Scene::initialiseDefault(char sky_map[])
     // setCameraQuaternion((float*)&default_camera_quat);
     // // Default resolution of 1920x1080.
     // setCameraRes(default_width, default_height);
-    // // Default horizontal FoV is 75 degrees.
+    // // Default horizontal FoV is 90 degrees.
     // setCameraFoV(default_fov);
 }
 
@@ -57,7 +58,7 @@ void Scene::importSkyMap(char image_path[])
     // This is usually too large for stack allocation, so host_sky_map becomes a pointer to a pixel array on the heap.
     // Force to load as RGB (3 bytes per pixel).
     host_sky_map = stbi_load(image_path, &sky_pixels_w, &sky_pixels_h, &byte_depth, 3);
-    if (host_sky_map != NULL)
+    if (host_sky_map != nullptr)
     {
         sky_pixels_w_f = static_cast<float>(sky_pixels_w);
         sky_pixels_h_f = static_cast<float>(sky_pixels_h);
@@ -90,6 +91,17 @@ void Scene::importSkyMap(char image_path[])
         {
             throw std::runtime_error("Error: failed to copy sky pixel height to device.");
         }
+
+        err = cudaMemcpyToSymbol(DeviceTraceTools::phi_interval, &phi_interval, sizeof(float));
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error("Error: failed to copy sky phi interval to device.");
+        }
+        err = cudaMemcpyToSymbol(DeviceTraceTools::theta_interval, &theta_interval, sizeof(float));
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error("Error: failed to copy sky theta interval to device.");
+        }
     }
     else
     {
@@ -114,10 +126,7 @@ void Scene::runTraceKernel()
         num_blocks_y += 1;
     }
     dim3 numBlocks(num_blocks_x, num_blocks_y);
-    for (int i { 0 }; i < 50; i++)
-    {
-        traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map, DeviceTraceTools::device_camera_pixel_array);
-    }
+    traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map, DeviceTraceTools::device_camera_pixel_array);
     // Copy image back to host.
     cudaError_t err;
     err = cudaMemcpy(host_camera_pixel_array, DeviceTraceTools::device_camera_pixel_array, 3*sizeof(unsigned char)*pixels_w*pixels_h, cudaMemcpyDeviceToHost);
@@ -177,6 +186,7 @@ void Scene::setCameraRes(int width, int height)
 }
 
 // Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
+// The camera resolution must be set first with setCameraRes()!
 void Scene::setCameraFoV(float new_fov_width)
 {
     fov_width = new_fov_width;
@@ -221,7 +231,7 @@ void Scene::setCameraQuaternion(float quaternion[4])
 // Calculates the start velocity of a photon at pixel (x, y), where (0, 0) is the top-left corner of the image.
 __device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pixel_y, float photon_v[4], float metric[4][4])
 {
-    float phi { (pixel_x - 0.5f*device_pixels_w) * device_fov_conversion_factor };
+    float phi { -((pixel_x - 0.5f*device_pixels_w) * device_fov_conversion_factor) };
     float theta { (pixel_y - 0.5f*device_pixels_h) * device_fov_conversion_factor + 0.5f*pi_device };
     // Convert to Cartesian coordinates.
     float unrotated_v[4];
@@ -590,12 +600,6 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
     getMetricTensor(x, metric);
 }
 
-// Gets a pointer to the RGB pixel from the sky map at pixel (x, y), where (0, 0) is the top-left pixel.
-__device__ void DeviceTraceTools::readPixelFromSkyMap(unsigned char *pixel, unsigned char *device_sky_map, int &x, int &y, int &sky_pixels_w, int &byte_depth)
-{
-    pixel = &device_sky_map[(y*sky_pixels_w + x)*byte_depth];
-}
-
 // Run the actual raytracing loop. All the appropriate variables need to be assigned and defined before this can work (without undefined behaviour).
 // TODO: Currently only defined for a camera outside the photon sphere of the Schwarzschild metric. Make this work for general metrics
 // (i.e. some sort of event horizon-detector to terminate a photon?).
@@ -610,14 +614,14 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
 
     int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
     int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
-    int pixel_index = 3*(pixel_y*DeviceTraceTools::device_pixels_w + pixel_x);
-    bool consumed = false;
 
     if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
     {
         float x[4];
         float v[4];
         float metric[4][4];
+        int pixel_index { 3*(pixel_y*DeviceTraceTools::device_pixels_w + pixel_x) };
+        bool consumed = false;
         #pragma unroll
         for (int i { 0 }; i < 4; i++)
         {
@@ -625,7 +629,7 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
         }
 
         DeviceTraceTools::getMetricTensor(x, metric);
-        DeviceTraceTools::calculateStartVelocity(pixel_x, pixel_y, v, metric);
+        DeviceTraceTools::calculateStartVelocity(static_cast<float>(pixel_x), static_cast<float>(pixel_y), v, metric);
         DeviceTraceTools::normaliseV(v);
 
         // Set to true if the photon enters the photon sphere.
@@ -643,20 +647,46 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
             DeviceTraceTools::advance(x, v, metric, &c_symbols[threadIdx.x][threadIdx.y][0], &metric_derivs[threadIdx.x][threadIdx.y][0]);
             dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
         }
-    }
 
-    if (consumed == true)
-    {
-        // Entered the photon sphere; set to black.
-        device_camera_pixel_array[pixel_index] = 0;
-        device_camera_pixel_array[pixel_index+1] = 0;
-        device_camera_pixel_array[pixel_index+2] = 0;
-    }
-    else
-    {
-        device_camera_pixel_array[pixel_index] = 150;
-        device_camera_pixel_array[pixel_index+1] = 150;
-        device_camera_pixel_array[pixel_index+2] = 150;
+        if (consumed == true)
+        {
+            // Entered the photon sphere; set to black.
+            device_camera_pixel_array[pixel_index] = 0;
+            device_camera_pixel_array[pixel_index+1] = 0;
+            device_camera_pixel_array[pixel_index+2] = 0;
+        }
+        else
+        {
+            // Sample the sky map by taking the photon to infinity.
+            float phi { atan2f(v[2], v[1]) };
+            if (phi < 0.)
+            {
+                // Get into the range 0 to 2pi.
+                phi += 2.*pi_device;
+            }
+            float theta { acosf(v[3] * rnorm3df(v[1], v[2], v[3])) };
+            // Convert to pixel locations on the sky map; floor the number.
+            // Because phi goes anticlockwise, 2.*pi - phi is needed here to
+            // stop images being reversed along phi.
+            int sky_x { (int)floor((2.*pi_device-phi) / DeviceTraceTools::phi_interval) };
+            int sky_y { (int)floor(theta / DeviceTraceTools::theta_interval) };
+            // These if statements stop errors when the ray is exactly along the +x or +z axis.
+            if (sky_x >= DeviceTraceTools::device_sky_pixels_w)
+            {
+                sky_x = DeviceTraceTools::device_sky_pixels_w - 1;
+            }
+            if (sky_y >= DeviceTraceTools::device_sky_pixels_h)
+            {
+                sky_y = DeviceTraceTools::device_sky_pixels_h - 1;
+            }
+            // Get pixel colour.
+            unsigned char *colour { &device_sky_map[3*(sky_y*DeviceTraceTools::device_sky_pixels_w + sky_x)] };
+            #pragma unroll
+            for (int i { 0 }; i < 3; i++)
+            {
+                device_camera_pixel_array[pixel_index+i] = colour[i];
+            }
+        }
     }
 }
 
@@ -669,6 +699,7 @@ __device__ void hamiltonProduct(float u[4], float v[4], float result[4])
     cross[0] = u[2]*v[3] - u[3]*v[2];
     cross[1] = u[3]*v[1] - u[1]*v[3];
     cross[2] = u[1]*v[2] - u[2]*v[1];
+    #pragma unroll
     for (int i { 1 }; i < 4; i++)
     {
         result[i] = u[0]*v[i] + v[0]*u[i] + cross[i-1];

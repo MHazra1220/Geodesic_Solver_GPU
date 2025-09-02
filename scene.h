@@ -33,10 +33,10 @@ class Scene
         // Once a photon reaches this distance, use its spatial velocity to extend it to infinity,
         // find its polar and azimuthal angles and get the appropriate pixel sky map.
         // TODO: a check is needed to make sure the camera never goes beyond this radius.
-        const float sky_map_distance { 50. };
+        const float sky_map_distance { 75. };
         const float sky_map_distance_squared { sky_map_distance*sky_map_distance };
         // Camera FoV width in degrees and radians.
-        float fov_width { 75. };
+        float fov_width;
         float fov_width_rad;
         float camera_coords[4];
         // Quaternion representing the camera orientation. (1., 0., 0., 0.) represents a camera pointing along +x with zero rotation.
@@ -65,7 +65,7 @@ class Scene
         // This default orientation corresponds to pointing along +x with no rotation.
         const float default_camera_quat[4] { 1., 0., 0., 0, };
         // Default horizontal FoV in degrees.
-        const float default_fov { 75. };
+        const float default_fov { 90. };
         // Default resolution.
         const int default_width { 1920 };
         const int default_height { 1080 };

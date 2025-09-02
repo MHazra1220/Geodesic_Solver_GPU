@@ -1,6 +1,8 @@
 #include "scene.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 #include <stdexcept>
 
 // These objects and functions are used by the GPU when tracing photons. They are defined outside Scene
@@ -14,8 +16,8 @@ namespace DeviceTraceTools
     // This points to the pixel array for the camera in device memory.
     unsigned char *device_camera_pixel_array { nullptr };
     // Default camera coordinates are along -x and the camera faces along +x.
-    __device__ float device_camera_coords[4] { 0., -10., 0., 0. };
-    __device__ float device_camera_quat[4] { 1., 0., 0., 0. };
+    __device__ float device_camera_coords[4];
+    __device__ float device_camera_quat[4];
     __device__ int device_pixels_w;
     __device__ int device_pixels_h;
     __device__ float device_fov_conversion_factor;
@@ -39,13 +41,13 @@ void Scene::initialiseDefault(char sky_map[])
 {
     // Note sky_map will already have decayed to a char* pointer here; no need to convert.
     importSkyMap(sky_map);
-    // Set camera quaternion to default position and orientation and copy to device.
-    setCameraCoordinates((float*)&default_camera_coords);
-    setCameraQuaternion((float*)&default_camera_quat);
-    // Default horizontal FoV is 75 degrees.
-    setCameraFoV(default_fov);
-    // Default resolution of 1920x1080.
-    setCameraRes(default_width, default_height);
+    // // Set camera quaternion to default position and orientation and copy to device.
+    // setCameraCoordinates((float*)&default_camera_coords);
+    // setCameraQuaternion((float*)&default_camera_quat);
+    // // Default resolution of 1920x1080.
+    // setCameraRes(default_width, default_height);
+    // // Default horizontal FoV is 75 degrees.
+    // setCameraFoV(default_fov);
 }
 
 // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
@@ -112,7 +114,23 @@ void Scene::runTraceKernel()
         num_blocks_y += 1;
     }
     dim3 numBlocks(num_blocks_x, num_blocks_y);
-    traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map);
+    for (int i { 0 }; i < 50; i++)
+    {
+        traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map, DeviceTraceTools::device_camera_pixel_array);
+    }
+    // Copy image back to host.
+    cudaError_t err;
+    err = cudaMemcpy(host_camera_pixel_array, DeviceTraceTools::device_camera_pixel_array, 3*sizeof(unsigned char)*pixels_w*pixels_h, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy camera pixel array from device to host.");
+    }
+}
+
+void Scene::writeCameraImage(char image_path[])
+{
+    unsigned char *data { &host_camera_pixel_array[0] };
+    stbi_write_jpg(image_path, pixels_w, pixels_h, 3, data, 100);
 }
 
 void Scene::freeHostPixelArrays()
@@ -125,20 +143,6 @@ void Scene::freeDevicePixelArrays()
 {
     cudaFree(DeviceTraceTools::device_sky_map);
     cudaFree(DeviceTraceTools::device_camera_pixel_array);
-}
-
-// Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
-void Scene::setCameraFoV(float new_fov_width)
-{
-    fov_width = new_fov_width;
-    fov_width_rad = fov_width * (pi_host/180.f);
-    float conversion_factor = fov_width_rad / sky_pixels_w_f;
-    cudaError_t err;
-    err = cudaMemcpyToSymbol(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float));
-    if (err != cudaSuccess)
-    {
-        throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
-    }
 }
 
 // Sets the width and height resolution of the camera and copies it to the device.
@@ -160,15 +164,29 @@ void Scene::setCameraRes(int width, int height)
     // Allocate memory for the camera pixel array.
     free(host_camera_pixel_array);
     cudaFree(DeviceTraceTools::device_camera_pixel_array);
-    host_camera_pixel_array = (unsigned char*)malloc(sizeof(unsigned char)*pixels_w*pixels_h);
+    host_camera_pixel_array = (unsigned char*)malloc(3*sizeof(unsigned char)*pixels_w*pixels_h);
     if (host_camera_pixel_array == nullptr)
     {
         throw std::runtime_error("Error: failed to allocate memory for camera pixel array on host.");
     }
-    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_pixel_array, sizeof(unsigned char)*pixels_w*pixels_h);
+    err = cudaMalloc((void **)&DeviceTraceTools::device_camera_pixel_array, 3*sizeof(unsigned char)*pixels_w*pixels_h);
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Error: failed to allocate memory for camera pixel array on device.");
+    }
+}
+
+// Set a new FoV in degrees and transfer the corresponding conversion factor to the device.
+void Scene::setCameraFoV(float new_fov_width)
+{
+    fov_width = new_fov_width;
+    fov_width_rad = fov_width * (pi_host/180.f);
+    float conversion_factor = fov_width_rad / pixels_w;
+    cudaError_t err;
+    err = cudaMemcpyToSymbol(DeviceTraceTools::device_fov_conversion_factor, &conversion_factor, sizeof(float));
+    if (err != cudaSuccess)
+    {
+        throw std::runtime_error("Error: failed to copy FoV conversion factor to device.");
     }
 }
 
@@ -456,12 +474,12 @@ __device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
     else
     {
         float dl;
-        // This is designed to give reasonable stability for 2-3 orbits on the photon sphere of a Schwarzschild black hole of radius 1.
-        dl = 1e-1 * (9./(deviation*deviation));
+        // This is designed to give reasonable stability for 1 or 2 orbits on the photon sphere of a Schwarzschild black hole of radius 1.
+        dl = 1e-1 * (8./(deviation*deviation));
         if (dl > 5.)
         {
             // Too large; set to max parameter step.
-            dl = 5.;
+            return 5.;
         }
         else
         {
@@ -475,6 +493,7 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
 {
     // Calculate parameter step.
     float dl { calculateParameterStep(metric) };
+    // float dl { 0.1 };
     float mult_factor { dl/6.f };
 
     // Currently advances with RK4.
@@ -493,6 +512,7 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
     for (int i { 0 }; i < 4; i++)
     {
         k_n_x[i] = v[i];
+        k_n_v[i] = 0;
         for (int j { 0 }; j < 4; j++)
         {
             #pragma unroll
@@ -522,6 +542,7 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
         for (int i { 0 }; i < 4; i++)
         {
             k_n_x[i] = v[i] + 0.5*dl*k_n_minus_1_v[i];
+            k_n_v[i] = 0;
             for (int j { 0 }; j < 4; j++)
             {
                 #pragma unroll
@@ -549,6 +570,7 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
     for (int i { 0 }; i < 4; i++)
     {
         k_n_x[i] = v[i] + dl*k_n_minus_1_v[i];
+        k_n_v[i] = 0.;
         for (int j { 0 }; j < 4; j++)
         {
             #pragma unroll
@@ -577,7 +599,7 @@ __device__ void DeviceTraceTools::readPixelFromSkyMap(unsigned char *pixel, unsi
 // Run the actual raytracing loop. All the appropriate variables need to be assigned and defined before this can work (without undefined behaviour).
 // TODO: Currently only defined for a camera outside the photon sphere of the Schwarzschild metric. Make this work for general metrics
 // (i.e. some sort of event horizon-detector to terminate a photon?).
-__global__ void traceImage(unsigned char *device_sky_map)
+__global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_camera_pixel_array)
 {
     // This is currently intended for 8x4 thread blocks.
     // TODO: For now, the Christoffel symbols are in shared memory and will use 8 KiB. Test later
@@ -588,6 +610,8 @@ __global__ void traceImage(unsigned char *device_sky_map)
 
     int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
     int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
+    int pixel_index = 3*(pixel_y*DeviceTraceTools::device_pixels_w + pixel_x);
+    bool consumed = false;
 
     if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
     {
@@ -605,9 +629,8 @@ __global__ void traceImage(unsigned char *device_sky_map)
         DeviceTraceTools::normaliseV(v);
 
         // Set to true if the photon enters the photon sphere.
-        bool consumed { false };
-        float sky_dist_squared { DeviceTraceTools::device_sky_map_distance_squared };
-        float dist_squared { x[1]*x[1] + x[2]*x[2] + x[3]*x[3] };
+        float sky_dist_squared = DeviceTraceTools::device_sky_map_distance_squared;
+        float dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
         while (dist_squared < sky_dist_squared)
         {
             if (dist_squared < 2.25)
@@ -620,6 +643,20 @@ __global__ void traceImage(unsigned char *device_sky_map)
             DeviceTraceTools::advance(x, v, metric, &c_symbols[threadIdx.x][threadIdx.y][0], &metric_derivs[threadIdx.x][threadIdx.y][0]);
             dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
         }
+    }
+
+    if (consumed == true)
+    {
+        // Entered the photon sphere; set to black.
+        device_camera_pixel_array[pixel_index] = 0;
+        device_camera_pixel_array[pixel_index+1] = 0;
+        device_camera_pixel_array[pixel_index+2] = 0;
+    }
+    else
+    {
+        device_camera_pixel_array[pixel_index] = 150;
+        device_camera_pixel_array[pixel_index+1] = 150;
+        device_camera_pixel_array[pixel_index+2] = 150;
     }
 }
 

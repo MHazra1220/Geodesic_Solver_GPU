@@ -48,9 +48,15 @@ class Scene
         // ------------- Function forward declarations.
         // Initialise scene parameters with no sky map and default camera parameters.
         void initialiseDefault(char sky_map[]);
+        void setSkyMapDistance(float sky_distance);
+        void setCameraRes(int width, int height);
+        void setCameraFoV(float new_fov_width);
+        void setCameraCoordinates(float x[4]);
+        void setCameraQuaternion(float quaternion[4]);
         // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.
         void importSkyMap(char image_path[]);
         void runTraceKernel();
+        void writeCameraImage(char image_path[]);
         void freeHostPixelArrays();
         void freeDevicePixelArrays();
 
@@ -66,13 +72,6 @@ class Scene
         // Pointer to the pixel array of the sky map and camera image on the host.
         unsigned char *host_sky_map { nullptr };
         unsigned char *host_camera_pixel_array { nullptr };
-
-        // ------------- Function forward declarations.
-        void setSkyMapDistance(float sky_distance);
-        void setCameraFoV(float new_fov_width);
-        void setCameraRes(int width, int height);
-        void setCameraCoordinates(float x[4]);
-        void setCameraQuaternion(float quaternion[4]);
 };
 
 // Some quaternion arithmetic functions. Used when setting the starting velocities of photons.
@@ -80,6 +79,6 @@ __device__ void hamiltonProduct(float u[4], float v[4], float result[4]);
 __device__ void rotateVecByQuat(float vec[4], float rotation_quat[4], float result[4]);
 
 // CUDA kernels.
-__global__ void traceImage(unsigned char *device_sky_map);
+__global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_camera_pixel_array);
 
 #endif

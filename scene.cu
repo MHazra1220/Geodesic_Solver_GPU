@@ -37,7 +37,7 @@ namespace DeviceTraceTools
     __device__ void normaliseV(float v_func[4]);
     __device__ void invertMetric(float metric_func[4][4], float metric_inverse[4][4]);
     __device__ float calculateParameterStep(float metric[4][4]);
-    __device__ void advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4]);
+    __device__ void advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4], bool stop_advance);
 };
 
 // Initialise Scene object with no sky map and default camera parameters.
@@ -130,7 +130,7 @@ void Scene::runTraceKernel()
     }
     dim3 numBlocks(num_blocks_x, num_blocks_y);
     // cudaProfilerStart();
-    for (int i { 0 }; i < 100; i++)
+    for (int i { 0 }; i < 1; i++)
     {
         traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map, DeviceTraceTools::device_camera_pixel_array);
     }
@@ -359,6 +359,8 @@ __device__ void DeviceTraceTools::makeVNull(float v_func[4], float metric_func[4
     // c is the scalar product of the spatial metric with the spatial velocity components.
     float c { 0. };
     float contraction;
+
+    #pragma unroll
     for (int i { 1 }; i < 4; i++)
     {
         b += metric_func[0][i] * v_func[i];
@@ -487,7 +489,7 @@ __device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
 }
 
 // Advances a photon/pixel with an adaptive timestep using RK4.
-__device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4])
+__device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4][4], float c_symbols[4][4][4], float metric_derivs[4][4][4], bool stop_advance)
 {
     // Calculate parameter step.
     float dl { calculateParameterStep(metric) };
@@ -581,9 +583,9 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
         x_step[i] += k_n_x[i];
         v_step[i] += k_n_v[i];
 
-        // Advance x and v.
-        x[i] += mult_factor*x_step[i];
-        v[i] += mult_factor*v_step[i];
+        // Advance x and v. If stop_advance is true, the photon cannot move.
+        x[i] += mult_factor*x_step[i]*(!stop_advance);
+        v[i] += mult_factor*v_step[i]*(!stop_advance);
     }
     // Update metric to get it ready for the next step.
     getMetricTensor(x, metric);
@@ -597,65 +599,99 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
     // This is currently intended for 8x4 thread blocks (small warps to help reduce warp divergence in raytracing).
     // __shared__ float c_symbols[8][4][4][4][4];
     // __shared__ float metric_derivs[8][4][4][4][4];
+    __shared__ bool pixel_done[8][4];
+    __shared__ bool pixel_valid[8][4];
 
     int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
     int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
 
-    if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
+    // if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
+    // {
+    // This stores both the coordinates and 4-velocity together to speed up memory access.
+    float xv[8];
+    float metric[4][4];
+    // These use a lot of memory; uncomment the __shared__ versions above and pass references to advance()
+    // if register spilling is a problem.
+    float c_symbols[4][4][4];
+    float metric_derivs[4][4][4];
+    int pixel_index { 3*(pixel_y*DeviceTraceTools::device_pixels_w + pixel_x) };
+
+    #pragma unroll
+    for (int i { 0 }; i < 4; i++)
     {
-        // This stores both the coordinates and 4-velocity together to speed up memory access.
-        float xv[8];
-        float metric[4][4];
-        // These use a lot of memory; uncomment the __shared__ versions above and pass references to advance()
-        // if register spilling is a problem.
-        float c_symbols[4][4][4];
-        float metric_derivs[4][4][4];
-        int pixel_index { 3*(pixel_y*DeviceTraceTools::device_pixels_w + pixel_x) };
-        bool consumed = false;
+        xv[i] = DeviceTraceTools::device_camera_coords[i];
+    }
 
+    DeviceTraceTools::getMetricTensor(&xv[0], metric);
+    DeviceTraceTools::calculateStartVelocity(static_cast<float>(pixel_x), static_cast<float>(pixel_y), &xv[4], metric);
+    DeviceTraceTools::normaliseV(&xv[4]);
+
+    // Set consumed to true if the photon enters the photon sphere.
+    float sky_dist_squared = DeviceTraceTools::device_sky_map_distance_squared;
+    float dist_squared = xv[1]*xv[1] + xv[2]*xv[2] + xv[3]*xv[3];
+
+    // Test if the pixel is actually in the image.
+    pixel_valid[threadIdx.x][threadIdx.y] = pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h;
+    int num_valid_pixels_in_block { 0 };
+    #pragma unroll
+    for (int i { 0 }; i < 8; i++)
+    {
         #pragma unroll
-        for (int i { 0 }; i < 4; i++)
+        for (int j { 0 }; j < 4; j++)
         {
-            xv[i] = DeviceTraceTools::device_camera_coords[i];
+            num_valid_pixels_in_block += pixel_valid[i][j];
         }
+    }
 
-        DeviceTraceTools::getMetricTensor(&xv[0], metric);
-        DeviceTraceTools::calculateStartVelocity(static_cast<float>(pixel_x), static_cast<float>(pixel_y), &xv[4], metric);
-        DeviceTraceTools::normaliseV(&xv[4]);
+    // Do this using the bool array pixel_done to avoid thread divergence in the while loop;
+    // it forces all threads to terminate the loop only when all threads are done.
+    bool stop_advance = true;
+    bool consumed = false;
+    int pixel_done_sum { 0 };
+    while (pixel_done_sum != num_valid_pixels_in_block)
+    {
+        // Fallen into the photon sphere if consumed is true.
+        consumed = dist_squared < 2.25;
+        stop_advance = (dist_squared > sky_dist_squared) || consumed;
+        pixel_done[threadIdx.x][threadIdx.y] = stop_advance;
+        // If consumed is true, then the advance will still calculate the step to avoid divergence,
+        // but it will not actually alter the photon's coordinates or velocity.
+        DeviceTraceTools::advance(&xv[0], &xv[4], metric, c_symbols, metric_derivs, stop_advance);
+        dist_squared = xv[1]*xv[1] + xv[2]*xv[2] + xv[3]*xv[3];
 
-        // Set consumed to true if the photon enters the photon sphere.
-        float sky_dist_squared = DeviceTraceTools::device_sky_map_distance_squared;
-        float dist_squared = xv[1]*xv[1] + xv[2]*xv[2] + xv[3]*xv[3];
-        while (dist_squared < sky_dist_squared)
+        // When this sum is 32, all threads will exit in lockstep. This should avoid thread divergence
+        // but still allow for all photons to be traced to completion.
+        pixel_done_sum = 0;
+        #pragma unroll
+        for (int i { 0 }; i < 8; i++)
         {
-            if (dist_squared < 2.25)
+            #pragma unroll
+            for (int j { 0 }; j < 4; j++)
             {
-                // Entered the photon radius if true; terminate the photon.
-                consumed = true;
-                break;
+                pixel_done_sum += pixel_done[i][j];
             }
-            // Otherwise, advance the simulation with RK4.
-            DeviceTraceTools::advance(&xv[0], &xv[4], metric, c_symbols, metric_derivs);
-            dist_squared = xv[1]*xv[1] + xv[2]*xv[2] + xv[3]*xv[3];
         }
+    }
 
-        // Warp divergence is likely in the while loop above, especially near the black hole;
-        // sync here to bring them all back in line.
-        __syncwarp();
+    // Sample the sky map by taking the photon to infinity (use only the velocity).
+    float phi { atan2(xv[6], xv[5]) };
+    // Get into the range 0 to 2pi if phi is negative.
+    phi += 2.*pi_device*(phi < 0.);
 
-        // Sample the sky map by taking the photon to infinity (use only the velocity).
-        float phi { atan2(xv[6], xv[5]) };
-        // Get into the range 0 to 2pi if phi is negative.
-        phi += 2.*pi_device*(phi < 0.);
+    float theta { acos(xv[7] * rnorm3df(xv[5], xv[6], xv[7])) };
+    // Convert to pixel locations on the sky map; floor the number.
+    // Because phi goes anticlockwise, 2.*pi - phi is needed here to
+    // stop images being reversed along phi.
+    int sky_x { (int)((2.*pi_device-phi) / DeviceTraceTools::phi_interval) };
+    int sky_y { (int)(theta / DeviceTraceTools::theta_interval) };
+    // Get pixel colour.
+    unsigned char *colour { &device_sky_map[3*(sky_y*DeviceTraceTools::device_sky_pixels_w + sky_x)] };
 
-        float theta { acos(xv[7] * rnorm3df(xv[5], xv[6], xv[7])) };
-        // Convert to pixel locations on the sky map; floor the number.
-        // Because phi goes anticlockwise, 2.*pi - phi is needed here to
-        // stop images being reversed along phi.
-        int sky_x { (int)((2.*pi_device-phi) / DeviceTraceTools::phi_interval) };
-        int sky_y { (int)(theta / DeviceTraceTools::theta_interval) };
-        // Get pixel colour.
-        unsigned char *colour { &device_sky_map[3*(sky_y*DeviceTraceTools::device_sky_pixels_w + sky_x)] };
+    // Some thread divergence near the right and bottom edges of the image seems inevitable here
+    // if the block dimensions don't fit exactly into the image dimensions. However, this is the end
+    // of the kernel, so the effect should be minor.
+    if (pixel_valid[threadIdx.x][threadIdx.y])
+    {
         #pragma unroll
         for (int i { 0 }; i < 3; i++)
         {

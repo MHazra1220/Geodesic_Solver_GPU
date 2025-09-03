@@ -130,7 +130,7 @@ void Scene::runTraceKernel()
     }
     dim3 numBlocks(num_blocks_x, num_blocks_y);
     // cudaProfilerStart();
-    for (int i { 0 }; i < 50; i++)
+    for (int i { 0 }; i < 100; i++)
     {
         traceImage<<<numBlocks, threadsPerBlock>>>(DeviceTraceTools::device_sky_map, DeviceTraceTools::device_camera_pixel_array);
     }
@@ -258,8 +258,8 @@ __device__ void DeviceTraceTools::calculateStartVelocity(float pixel_x, float pi
 __device__ void DeviceTraceTools::getMetricTensor(float x_func[4], float metric_func[4][4])
 {
     const float r_s { 1. };
-    float r { norm3df(x_func[1], x_func[2], x_func[3]) };
-    float r_squared { r*r };
+    float r_squared { x_func[1]*x_func[1] + x_func[2]*x_func[2] + x_func[3]*x_func[3] };
+    float r { sqrt(r_squared) };
     float mult_factor { r_s / (r_squared*(r-r_s)) };
     for (int mu { 1 }; mu < 4; mu++)
     {
@@ -363,6 +363,7 @@ __device__ void DeviceTraceTools::makeVNull(float v_func[4], float metric_func[4
     {
         b += metric_func[0][i] * v_func[i];
         contraction = 0.;
+        #pragma unroll
         for (int j { 1 }; j < 4; j++)
         {
             contraction += metric_func[i][j] * v_func[j];
@@ -375,11 +376,11 @@ __device__ void DeviceTraceTools::makeVNull(float v_func[4], float metric_func[4
     v_func[0] = (-b + sqrt(b*b - 4.*a*c)) / (2.*a);
 }
 
-// Makes the L2 norm of the velocity 1 for the sake of maintaining a roughly consistent affine parameter.
+// Makes the L2 norm of the spatial velocity 1 for the sake of maintaining a roughly consistent affine parameter.
 // This does turn it into a "unit" velocity!
 __device__ void DeviceTraceTools::normaliseV(float v_func[4])
 {
-    float inv_norm { rnorm4df(v_func[0], v_func[1], v_func[2], v_func[3]) };
+    float inv_norm { rnorm3df(v_func[1], v_func[2], v_func[3]) };
     v_func[0] *= inv_norm;
     v_func[1] *= inv_norm;
     v_func[2] *= inv_norm;
@@ -478,26 +479,11 @@ __device__ float DeviceTraceTools::calculateParameterStep(float metric[4][4])
         }
     }
 
-    if (deviation == 0)
-    {
-        // Metric is flat; set to the maximum step size.
-        return 5.;
-    }
-    else
-    {
-        float dl;
-        // This is designed to give reasonable stability for 1 or 2 orbits on the photon sphere of a Schwarzschild black hole of radius 1.
-        dl = 1e-1 * (27./(deviation*deviation*deviation));
-        if (dl < 5.)
-        {
-            return dl;
-        }
-        else
-        {
-            // Too large; set to max parameter step.
-            return 5.;
-        }
-    }
+    float dl { 1e-1f * (9.f/(deviation*deviation)) };
+    // This is designed to give reasonable stability for 1 or 2 orbits on the photon sphere of a Schwarzschild black hole of radius 1.
+    bool too_large { dl > 5. };
+    // Returns the maximum allowed step of 5 units if dl is too big.
+    return dl*(!too_large) + 5.*too_large;
 }
 
 // Advances a photon/pixel with an adaptive timestep using RK4.
@@ -509,7 +495,7 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
     float mult_factor { dl/6.f };
 
     // Currently advances with RK4.
-    // WARNING: Potential register spilling here; this requires a lot of memory.
+    // WARNING: Potential for register spilling here; this requires a lot of memory.
     float x_step[4];
     float v_step[4];
     float x_temp[4];
@@ -609,35 +595,37 @@ __device__ void DeviceTraceTools::advance(float x[4], float v[4], float metric[4
 __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_camera_pixel_array)
 {
     // This is currently intended for 8x4 thread blocks (small warps to help reduce warp divergence in raytracing).
-    // TODO: For now, the Christoffel symbols and metric derivatives are currently in shared memory and will use
-    // 512 bytes. This does fit on the register on my GPU (RTX 5070 Ti), but I think this will probably cause register
-    // spilling on less powerful GPUs. To be safe, keep them in shared for now.
-    __shared__ float c_symbols[8][4][4][4][4];
-    __shared__ float metric_derivs[8][4][4][4][4];
+    // __shared__ float c_symbols[8][4][4][4][4];
+    // __shared__ float metric_derivs[8][4][4][4][4];
 
     int pixel_x = blockIdx.x*blockDim.x + threadIdx.x;
     int pixel_y = blockIdx.y*blockDim.y + threadIdx.y;
 
     if (pixel_x < DeviceTraceTools::device_pixels_w && pixel_y < DeviceTraceTools::device_pixels_h)
     {
-        float x[4];
-        float v[4];
+        // This stores both the coordinates and 4-velocity together to speed up memory access.
+        float xv[8];
         float metric[4][4];
+        // These use a lot of memory; uncomment the __shared__ versions above and pass references to advance()
+        // if register spilling is a problem.
+        float c_symbols[4][4][4];
+        float metric_derivs[4][4][4];
         int pixel_index { 3*(pixel_y*DeviceTraceTools::device_pixels_w + pixel_x) };
         bool consumed = false;
+
         #pragma unroll
         for (int i { 0 }; i < 4; i++)
         {
-            x[i] = DeviceTraceTools::device_camera_coords[i];
+            xv[i] = DeviceTraceTools::device_camera_coords[i];
         }
 
-        DeviceTraceTools::getMetricTensor(x, metric);
-        DeviceTraceTools::calculateStartVelocity(static_cast<float>(pixel_x), static_cast<float>(pixel_y), v, metric);
-        DeviceTraceTools::normaliseV(v);
+        DeviceTraceTools::getMetricTensor(&xv[0], metric);
+        DeviceTraceTools::calculateStartVelocity(static_cast<float>(pixel_x), static_cast<float>(pixel_y), &xv[4], metric);
+        DeviceTraceTools::normaliseV(&xv[4]);
 
         // Set consumed to true if the photon enters the photon sphere.
         float sky_dist_squared = DeviceTraceTools::device_sky_map_distance_squared;
-        float dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+        float dist_squared = xv[1]*xv[1] + xv[2]*xv[2] + xv[3]*xv[3];
         while (dist_squared < sky_dist_squared)
         {
             if (dist_squared < 2.25)
@@ -647,19 +635,20 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
                 break;
             }
             // Otherwise, advance the simulation with RK4.
-            DeviceTraceTools::advance(x, v, metric, &c_symbols[threadIdx.x][threadIdx.y][0], &metric_derivs[threadIdx.x][threadIdx.y][0]);
-            dist_squared = x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+            DeviceTraceTools::advance(&xv[0], &xv[4], metric, c_symbols, metric_derivs);
+            dist_squared = xv[1]*xv[1] + xv[2]*xv[2] + xv[3]*xv[3];
         }
 
-        // Some warp divergence is inevitable in the while loop above; sync here to bring them all back in line.
+        // Warp divergence is likely in the while loop above, especially near the black hole;
+        // sync here to bring them all back in line.
         __syncwarp();
 
         // Sample the sky map by taking the photon to infinity (use only the velocity).
-        float phi { atan2(v[2], v[1]) };
+        float phi { atan2(xv[6], xv[5]) };
         // Get into the range 0 to 2pi if phi is negative.
         phi += 2.*pi_device*(phi < 0.);
 
-        float theta { acos(v[3] * rnorm3df(v[1], v[2], v[3])) };
+        float theta { acos(xv[7] * rnorm3df(xv[5], xv[6], xv[7])) };
         // Convert to pixel locations on the sky map; floor the number.
         // Because phi goes anticlockwise, 2.*pi - phi is needed here to
         // stop images being reversed along phi.

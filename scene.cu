@@ -45,13 +45,6 @@ void Scene::initialiseDefault(char sky_map[])
 {
     // Note sky_map will already have decayed to a char* pointer here; no need to convert.
     importSkyMap(sky_map);
-    // // Set camera quaternion to default position and orientation and copy to device.
-    // setCameraCoordinates((float*)&default_camera_coords);
-    // setCameraQuaternion((float*)&default_camera_quat);
-    // // Default resolution of 1920x1080.
-    // setCameraRes(default_width, default_height);
-    // // Default horizontal FoV is 90 degrees.
-    // setCameraFoV(default_fov);
 }
 
 // Sky map image should be a 2:1 aspect ratio, 360-degree panoramic image, but there is no restriction on this.

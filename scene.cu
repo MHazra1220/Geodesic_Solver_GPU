@@ -648,7 +648,7 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
     bool stop_advance = true;
     bool consumed = false;
     int pixel_done_sum { 0 };
-    while (pixel_done_sum != num_valid_pixels_in_block)
+    while (pixel_done_sum < num_valid_pixels_in_block)
     {
         // Fallen into the photon sphere if consumed is true.
         consumed = dist_squared < 2.25;
@@ -690,7 +690,7 @@ __global__ void traceImage(unsigned char *device_sky_map, unsigned char *device_
     // Some thread divergence near the right and bottom edges of the image seems inevitable here
     // if the block dimensions don't fit exactly into the image dimensions. However, this is the end
     // of the kernel, so the effect should be minor.
-    if (pixel_valid[threadIdx.x][threadIdx.y])
+    if (pixel_valid[threadIdx.x][threadIdx.y] == true)
     {
         #pragma unroll
         for (int i { 0 }; i < 3; i++)
